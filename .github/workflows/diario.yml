@@ -82,9 +82,33 @@ jobs:
         with:
           name: base
           path: data
+      - name: Traer la descarga de Hareruya hecha en tu PC
+        id: pc
+        run: |
+          mkdir -p data/tiendas/hareruya/descargas
+          gh release download hareruya-pc --repo "$GITHUB_REPOSITORY" --dir data/tiendas/hareruya/descargas --clobber \
+            --pattern 'hareruya_seco_*' || echo "No hay descarga de la PC."
+          HOY=$(date +%Y%m%d)
+          if ls data/tiendas/hareruya/descargas/hareruya_seco_${HOY}_*.jsonl.gz >/dev/null 2>&1; then
+            echo "Se usa la descarga de hoy hecha en la PC."
+            echo "listo=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "La PC no subio la de hoy: se intenta descargar desde GitHub."
+            rm -f data/tiendas/hareruya/descargas/hareruya_seco_*
+          fi
+      - name: Juntar el historial de Hareruya de tu PC (agrega los dias que falten; nunca reemplaza)
+        run: |
+          mkdir -p pc
+          if gh release download hareruya-pc --repo "$GITHUB_REPOSITORY" --dir pc --clobber --pattern 'historial_hareruya_pc.sqlite.gz'; then
+            python src/hareruya.py juntar pc/historial_hareruya_pc.sqlite.gz
+          else
+            echo "La PC no subio su historial."
+          fi
       - name: Descargar Hareruya
+        if: ${{ steps.pc.outputs.listo != '1' }}
         run: python src/hareruya.py descargar --workers 6     # 6 a la vez (16 desde GitHub hace que Hareruya bloquee)
       - name: Revisar que Hareruya si respondio
+        if: ${{ steps.pc.outputs.listo != '1' }}
         run: |
           python - <<'PY'
           import gzip, json, sys
