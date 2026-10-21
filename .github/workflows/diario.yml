@@ -61,6 +61,7 @@ jobs:
             data/tiendas/cardkingdom/ck.sqlite
             data/tiendas/starcitygames/scg.sqlite
             data/tiendas/hareruya/historial_hareruya.sqlite
+            data/tiendas/hareruya/emparejado/emparejado_*.sqlite
           retention-days: 2
           compression-level: 1
           if-no-files-found: error
@@ -82,7 +83,24 @@ jobs:
           name: base
           path: data
       - name: Descargar Hareruya
-        run: python src/hareruya.py descargar
+        run: python src/hareruya.py descargar --workers 6     # 6 a la vez (16 desde GitHub hace que Hareruya bloquee)
+      - name: Revisar que Hareruya si respondio
+        run: |
+          python - <<'PY'
+          import gzip, json, sys
+          from pathlib import Path
+          prog = json.loads(Path("data/tiendas/hareruya/progreso.json").read_text(encoding="utf-8"))
+          print(f"Hareruya: {prog.get('hechas')}/{prog.get('total')} cartas, {prog.get('productos')} productos, {prog.get('errores')} con error")
+          if int(prog.get("productos") or 0) > 0:
+              sys.exit(0)
+          secos = sorted(Path("data/tiendas/hareruya/descargas").glob("hareruya_seco_*.jsonl.gz"))
+          if secos:
+              with gzip.open(secos[-1], "rt", encoding="utf-8") as f:
+                  for _, linea in zip(range(3), f):
+                      print("  ", json.loads(linea).get("detalle"))
+          print("::error::Hareruya no devolvio productos (probablemente bloqueo a GitHub). Se publica el de la ultima vez.")
+          sys.exit(1)
+          PY
       - name: Emparejar con Scryfall
         run: python src/hareruya.py emparejar
       - name: Pasar al historial
