@@ -2323,6 +2323,35 @@ def descargar(n=None, workers=N_WORKERS, pausa=PAUSA_SEGUNDOS, nueva=False):
 REPO_NUBE, TAG_PC = "Guayaba7/stack-datos", "hareruya-pc"
 
 
+ASSET_HIST_PC = "historial_hareruya_pc.sqlite.gz"
+
+
+def juntar_historial(otro):
+    """Agrega al historial de Hareruya los dias que trae OTRO historial y que aqui no estan (nunca reemplaza un dia)."""
+    otro = Path(otro)
+    if str(otro).endswith(".gz"):                   # el que sube la PC viene comprimido
+        crudo = otro.with_name(otro.name[:-3])
+        with gzip.open(otro, "rb") as fi, open(crudo, "wb") as fo:
+            shutil.copyfileobj(fi, fo, 1 << 20)
+        otro = crudo
+    RUTA_HIST_HAR.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(RUTA_HIST_HAR, timeout=30)
+    try:
+        con.executescript(DDL_HIST_HAR)
+        con.execute("ATTACH DATABASE ? AS otro", (f"{otro.resolve().as_uri()}?mode=ro",))
+        nuevos = [d for (d,) in con.execute("SELECT dia FROM otro.dias WHERE dia NOT IN (SELECT dia FROM main.dias) ORDER BY dia")]
+        for d in nuevos:
+            con.execute("INSERT INTO main.precios SELECT * FROM otro.precios WHERE dia = ?", (d,))
+            con.execute("INSERT INTO main.dias SELECT * FROM otro.dias WHERE dia = ?", (d,))
+        con.commit()
+        total = con.execute("SELECT COUNT(*) FROM main.dias").fetchone()[0]
+    finally:
+        con.close()
+    print(f"Historial de Hareruya: {len(nuevos)} dia(s) agregado(s) de {otro.name}" + (f" ({', '.join(nuevos)})" if nuevos else "")
+          + f"; ahora tiene {total}.", flush=True)
+    return nuevos
+
+
 def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
     """Descarga Hareruya (retoma si quedo a medias) y sube el resultado a la nube para que el workflow lo use."""
     import subprocess
@@ -2337,6 +2366,20 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
     if not meta.get("completo") or not int(meta.get("productos") or 0):
         sys.exit(f"La descarga no quedo completa ({meta.get('procesadas')}/{meta.get('cartas_plan')} cartas): no se sube.")
     archivos = [ruta, ruta.with_name(ruta.name.replace(".jsonl.gz", ".meta.json"))]
+    if RUTA_HIST_HAR.is_file():                     # tu historial tambien: la nube agrega los dias que le falten
+        import tempfile
+        copia = Path(tempfile.gettempdir()) / "historial_hareruya_pc.sqlite"
+        origen = sqlite3.connect(f"{RUTA_HIST_HAR.resolve().as_uri()}?mode=ro", uri=True)
+        destino = sqlite3.connect(copia)
+        try:
+            origen.backup(destino)
+        finally:
+            destino.close()
+            origen.close()
+        with open(copia, "rb") as fi, gzip.open(copia.with_name(ASSET_HIST_PC), "wb", compresslevel=6) as fo:
+            shutil.copyfileobj(fi, fo, 1 << 20)
+        copia.unlink(missing_ok=True)
+        archivos.append(copia.with_name(ASSET_HIST_PC))
     if corre("release", "view", tag, "--repo", repo).returncode != 0:   # pre-release: nunca es el 'latest' de los datos
         c = corre("release", "create", tag, "--repo", repo, "--prerelease", "--latest=false", "--title", "Hareruya (desde la PC)",
                   "--notes", "Descarga de Hareruya hecha en la PC (Hareruya bloquea a GitHub). La usa el workflow diario.")
@@ -2356,9 +2399,10 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
 # ====================================================================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hareruya.py", description="Precios de Hareruya para Stack.")
-    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "emparejar", "detener", "historial", "nube"],
+    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "emparejar", "detener", "historial", "nube", "juntar"],
                     help="descargar (por defecto; retoma la que haya quedado a medias), emparejar (Stack lo hace solo), detener, "
                          "o historial (pasa al historial los emparejados que falten; con --todo empareja tambien las descargas viejas)")
+    ap.add_argument("archivo", nargs="?", help="juntar: el otro historial (.sqlite o .sqlite.gz)")
     ap.add_argument("--n", type=int, help="solo N nombres al azar (prueba rapida)")
     ap.add_argument("--workers", type=int, default=N_WORKERS, help=f"procesos en paralelo (por defecto {N_WORKERS})")
     ap.add_argument("--nueva", action="store_true", help="empezar una descarga nueva aunque haya una a medias")
@@ -2368,6 +2412,8 @@ def main(argv=None):
         CARPETA_SECO.mkdir(parents=True, exist_ok=True)
         (CARPETA_SECO / "DETENER.txt").write_text("detener", encoding="utf-8")
         print("Se pidio detener la descarga: termina la carta en curso y guarda.")
+    elif a.accion == "juntar":                      # juntar ARCHIVO: agrega al historial los dias de otro historial
+        juntar_historial(a.archivo)
     elif a.accion == "nube":                        # en tu PC: descargar y subir a la nube (ver subir_a_nube)
         subir_a_nube()
     elif a.accion == "emparejar":
