@@ -2352,6 +2352,39 @@ def juntar_historial(otro):
     return nuevos
 
 
+def hareruya_disponible():
+    """(True, '') si Hareruya responde busquedas; (False, motivo) si esta en mantenimiento, bloqueado o sin red."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            filas = buscar_carta("Lightning Bolt")
+        except Exception as e:                       # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
+    if filas:
+        return True, ""
+    texto = buf.getvalue()
+    if "\u30e1\u30f3\u30c6\u30ca\u30f3\u30b9" in texto or "maintenance" in texto.lower():   # メンテナンス
+        return False, "Hareruya esta en mantenimiento"
+    return False, (" ".join(texto.split())[:300] or "Hareruya no devolvio resultados")
+
+
+def _historial_para_subir():
+    """Copia comprimida de tu historial de Hareruya (la nube le agrega los dias que le falten)."""
+    import tempfile
+    copia = Path(tempfile.gettempdir()) / "historial_hareruya_pc.sqlite"
+    origen = sqlite3.connect(f"{RUTA_HIST_HAR.resolve().as_uri()}?mode=ro", uri=True)
+    destino = sqlite3.connect(copia)
+    try:
+        origen.backup(destino)
+    finally:
+        destino.close()
+        origen.close()
+    with open(copia, "rb") as fi, gzip.open(copia.with_name(ASSET_HIST_PC), "wb", compresslevel=6) as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+    copia.unlink(missing_ok=True)
+    return copia.with_name(ASSET_HIST_PC)
+
+
 def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
     """Descarga Hareruya (retoma si quedo a medias) y sube el resultado a la nube para que el workflow lo use."""
     import subprocess
@@ -2359,27 +2392,24 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
     if not gh:
         sys.exit("Falta GitHub CLI (https://cli.github.com) con sesion:  gh auth login")
     corre = lambda *a: subprocess.run([gh, *a], capture_output=True, text=True, encoding="utf-8", errors="replace")
-    ruta = descargar()                              # termina la que haya quedado a medias...
-    if dia_de_seco(ruta) != datetime.now().date().isoformat():
-        ruta = descargar(nueva=True)                # ...y si era de otro dia, baja la de hoy
-    meta = meta_seco(ruta)
-    if not meta.get("completo") or not int(meta.get("productos") or 0):
-        sys.exit(f"La descarga no quedo completa ({meta.get('procesadas')}/{meta.get('cartas_plan')} cartas): no se sube.")
-    archivos = [ruta, ruta.with_name(ruta.name.replace(".jsonl.gz", ".meta.json"))]
-    if RUTA_HIST_HAR.is_file():                     # tu historial tambien: la nube agrega los dias que le falten
-        import tempfile
-        copia = Path(tempfile.gettempdir()) / "historial_hareruya_pc.sqlite"
-        origen = sqlite3.connect(f"{RUTA_HIST_HAR.resolve().as_uri()}?mode=ro", uri=True)
-        destino = sqlite3.connect(copia)
-        try:
-            origen.backup(destino)
-        finally:
-            destino.close()
-            origen.close()
-        with open(copia, "rb") as fi, gzip.open(copia.with_name(ASSET_HIST_PC), "wb", compresslevel=6) as fo:
-            shutil.copyfileobj(fi, fo, 1 << 20)
-        copia.unlink(missing_ok=True)
-        archivos.append(copia.with_name(ASSET_HIST_PC))
+    ok, motivo = hareruya_disponible()
+    ruta = meta = None
+    if not ok:
+        print(f"No se descarga: {motivo}. Se sube solo tu historial.", flush=True)
+    else:
+        ruta = descargar()                          # termina la que haya quedado a medias...
+        if dia_de_seco(ruta) != datetime.now().date().isoformat():
+            ruta = descargar(nueva=True)            # ...y si era de otro dia, baja la de hoy
+        meta = meta_seco(ruta)
+        if not meta.get("completo") or not int(meta.get("productos") or 0):
+            print(f"La descarga no quedo completa ({meta.get('procesadas')}/{meta.get('cartas_plan')} cartas): "
+                  "no se sube (se sube solo tu historial).", flush=True)
+            ruta = None
+    archivos = [ruta, ruta.with_name(ruta.name.replace(".jsonl.gz", ".meta.json"))] if ruta else []
+    if RUTA_HIST_HAR.is_file():                     # tu historial siempre: la nube agrega los dias que le falten
+        archivos.append(_historial_para_subir())
+    if not archivos:
+        sys.exit("No hay nada que subir.")
     if corre("release", "view", tag, "--repo", repo).returncode != 0:   # pre-release: nunca es el 'latest' de los datos
         c = corre("release", "create", tag, "--repo", repo, "--prerelease", "--latest=false", "--title", "Hareruya (desde la PC)",
                   "--notes", "Descarga de Hareruya hecha en la PC (Hareruya bloquea a GitHub). La usa el workflow diario.")
@@ -2391,7 +2421,10 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
     u = corre("release", "upload", tag, *map(str, archivos), "--repo", repo, "--clobber")
     if u.returncode != 0:
         sys.exit("No se pudo subir: " + u.stderr.strip())
-    print(f"Subido a la nube ({repo}, {tag}): {ruta.name} | {int(meta['productos']):,} productos", flush=True)
+    print(f"Subido a la nube ({repo}, {tag}): " + ", ".join(a.name for a in archivos)
+          + (f" | {int(meta['productos']):,} productos" if ruta else ""), flush=True)
+    if ruta is None:
+        sys.exit(1)
 
 
 # ====================================================================================================
@@ -2399,7 +2432,7 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
 # ====================================================================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hareruya.py", description="Precios de Hareruya para Stack.")
-    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "emparejar", "detener", "historial", "nube", "juntar"],
+    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "emparejar", "detener", "historial", "nube", "juntar", "probar"],
                     help="descargar (por defecto; retoma la que haya quedado a medias), emparejar (Stack lo hace solo), detener, "
                          "o historial (pasa al historial los emparejados que falten; con --todo empareja tambien las descargas viejas)")
     ap.add_argument("archivo", nargs="?", help="juntar: el otro historial (.sqlite o .sqlite.gz)")
@@ -2412,6 +2445,10 @@ def main(argv=None):
         CARPETA_SECO.mkdir(parents=True, exist_ok=True)
         (CARPETA_SECO / "DETENER.txt").write_text("detener", encoding="utf-8")
         print("Se pidio detener la descarga: termina la carta en curso y guarda.")
+    elif a.accion == "probar":                      # 0 si Hareruya responde (lo usa la nube para reintentar)
+        ok, motivo = hareruya_disponible()
+        print("Hareruya responde." if ok else f"Hareruya no responde: {motivo}")
+        sys.exit(0 if ok else 1)
     elif a.accion == "juntar":                      # juntar ARCHIVO: agrega al historial los dias de otro historial
         juntar_historial(a.archivo)
     elif a.accion == "nube":                        # en tu PC: descargar y subir a la nube (ver subir_a_nube)
