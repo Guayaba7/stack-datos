@@ -106,9 +106,12 @@ jobs:
           fi
       - name: Descargar Hareruya
         if: ${{ steps.pc.outputs.listo != '1' }}
+        continue-on-error: true
         run: python src/hareruya.py descargar --workers 6     # 6 a la vez (16 desde GitHub hace que Hareruya bloquee)
       - name: Revisar que Hareruya si respondio
+        id: revisar
         if: ${{ steps.pc.outputs.listo != '1' }}
+        continue-on-error: true            # aunque Hareruya no responda, el historial juntado de tu PC si se publica
         run: |
           python - <<'PY'
           import gzip, json, sys
@@ -126,8 +129,10 @@ jobs:
           sys.exit(1)
           PY
       - name: Emparejar con Scryfall
+        if: ${{ steps.pc.outputs.listo == '1' || steps.revisar.outcome == 'success' }}
         run: python src/hareruya.py emparejar
       - name: Pasar al historial
+        if: ${{ steps.pc.outputs.listo == '1' || steps.revisar.outcome == 'success' }}
         run: python src/hareruya.py historial
       - uses: actions/upload-artifact@v4
         with:
