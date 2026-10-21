@@ -85,21 +85,36 @@ def dia_de_emparejado(meta):
     return d if PATRON_DIA.match(d) else ""
 
 
+def productos_de(meta):
+    try:
+        return int(meta.get("productos") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def emparejado_mas_reciente(carpetas):
-    """(ruta, dia) del emparejado COMPLETO mas nuevo que haya en cualquiera de las carpetas."""
-    mejor = None
+    """(ruta, dia) del emparejado COMPLETO mas nuevo que haya en cualquiera de las carpetas. Uno con muy pocos productos
+    (Hareruya bloqueo la descarga o se corto) no reemplaza al bueno anterior: se publica el anterior."""
+    candidatos = []
     for c in carpetas:
         if not Path(c).is_dir():
             continue
         for ruta in Path(c).glob("emparejado_*.sqlite"):
             m = meta_de(ruta)
             dia = dia_de_emparejado(m)
-            if m.get("completo") != "1" or not dia:
+            if m.get("completo") != "1" or not dia or productos_de(m) <= 0:
                 continue
-            clave = (dia, ruta.stat().st_mtime)
-            if mejor is None or clave > mejor[0]:
-                mejor = (clave, ruta, dia)
-    return (mejor[1], mejor[2]) if mejor else (None, None)
+            candidatos.append(((dia, ruta.stat().st_mtime), ruta, dia, productos_de(m)))
+    if not candidatos:
+        return None, None
+    tope = max(c[3] for c in candidatos)
+    buenos = [c for c in candidatos if c[3] >= 0.3 * tope]          # menos del 30% del mejor: descarga a medias
+    for c in sorted(candidatos, key=lambda c: c[0], reverse=True):
+        if c not in buenos:
+            print(f"  (se ignora {c[1].name}: solo {c[3]:,} productos contra {tope:,})")
+            break
+    _, ruta, dia, _ = max(buenos, key=lambda c: c[0])
+    return ruta, dia
 
 
 def copia_consistente(origen, destino):
@@ -137,11 +152,13 @@ def publicar(salida, tag, capas):
     datas = [Path(c) / "data" for c in capas]
     man = {"esquema": ESQUEMA, "tag": tag, "generado_utc": ahora_utc(), "archivos": []}
     for asset, (ruta, consulta) in ARCHIVOS.items():
-        origen = next((d / ruta for d in reversed(datas) if (d / ruta).is_file()), None)
-        if origen is None:
+        # de todas las capas, la que trae MAS (dia mas nuevo, luego mas dias); en empate gana la ultima. Asi una tienda que
+        # fallo (por ejemplo, un historial que quedo vacio) nunca tapa lo bueno que ya habia.
+        opciones = [(dias_de(d / ruta, consulta), k, d / ruta) for k, d in enumerate(datas) if (d / ruta).is_file()]
+        if not opciones:
             print(f"  (sin {ruta}: no se publica)")
             continue
-        dias = dias_de(origen, consulta)
+        dias, _, origen = max(opciones, key=lambda o: ((o[0][-1] if o[0] else ""), len(o[0]), o[1]))
         crudo, comp, sha = comprimir(origen, salida / asset)
         man["archivos"].append({"asset": asset, "ruta": ruta, "dias": dias, "dia": dias[-1] if dias else None,
                                 "bytes": crudo, "gz_bytes": comp, "sha256": sha})
