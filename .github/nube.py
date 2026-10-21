@@ -176,29 +176,74 @@ def publicar(salida, tag, capas):
     return man
 
 
+def _instalar(gz, a):
+    destino = RAIZ / "data" / a["ruta"]
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destino.with_name(destino.name + ".part")
+    with gzip.open(gz, "rb") as fi, open(tmp, "wb") as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+    os.replace(tmp, destino)
+
+
+def _de_releases_anteriores(faltan, ya_tag):
+    """Si al ultimo release le falta algun archivo (una tienda que fallo), se toma del release anterior que si lo tenga.
+    Usa GitHub CLI (en el workflow ya esta). Devuelve cuantos se recuperaron."""
+    import subprocess
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not faltan or not repo or not shutil.which("gh"):
+        return 0
+    r = subprocess.run(["gh", "release", "list", "--repo", repo, "--limit", "30", "--json", "tagName,createdAt"],
+                       capture_output=True, text=True)
+    try:
+        tags = [x["tagName"] for x in sorted(json.loads(r.stdout or "[]"), key=lambda x: x["createdAt"], reverse=True)
+                if x["tagName"].startswith("datos-") and x["tagName"] != ya_tag]
+    except ValueError:
+        return 0
+    n = 0
+    for tag in tags:
+        if not faltan:
+            break
+        with tempfile.TemporaryDirectory() as tmp:
+            if subprocess.run(["gh", "release", "download", tag, "--repo", repo, "--dir", tmp, "--pattern", "manifest.json"],
+                              capture_output=True).returncode != 0:
+                continue
+            man = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
+            for a in [x for x in man.get("archivos", []) if x["asset"] in faltan and (x.get("dias") or [])]:
+                if subprocess.run(["gh", "release", "download", tag, "--repo", repo, "--dir", tmp, "--pattern", a["asset"]],
+                                  capture_output=True).returncode != 0:
+                    continue
+                _instalar(Path(tmp) / a["asset"], a)
+                faltan.discard(a["asset"])
+                n += 1
+                print(f"  {a['asset']} -> data/{a['ruta']} ({a.get('dia') or '-'}) [del release anterior {tag}]")
+    for f in sorted(faltan):
+        print(f"  (ningun release reciente tiene {f})")
+    return n
+
+
 def restaurar(carpeta):
-    """Descomprime en data/ los archivos de un release ya descargado en CARPETA (con su manifest.json)."""
+    """Descomprime en data/ los archivos de un release ya descargado en CARPETA (con su manifest.json). Lo que le falte
+    (o venga vacio) se toma del release anterior que lo tenga: una tienda que falla un dia no se pierde."""
     carpeta = Path(carpeta)
     ruta_man = carpeta / "manifest.json"
-    if not ruta_man.is_file():
-        print(f"No hay manifest.json en {carpeta}: se empieza sin datos anteriores.")
-        return 0
-    man = json.loads(ruta_man.read_text(encoding="utf-8"))
-    n = 0
+    man = json.loads(ruta_man.read_text(encoding="utf-8")) if ruta_man.is_file() else {}
+    if not man:
+        print(f"No hay manifest.json en {carpeta}: se buscan los datos en los releases anteriores.")
+    n, tienen = 0, set()
     for a in man.get("archivos", []):
         gz = carpeta / a["asset"]
         if not gz.is_file():
             print(f"  falta {a['asset']}")
             continue
-        destino = RAIZ / "data" / a["ruta"]
-        destino.parent.mkdir(parents=True, exist_ok=True)
-        tmp = destino.with_name(destino.name + ".part")
-        with gzip.open(gz, "rb") as fi, open(tmp, "wb") as fo:
-            shutil.copyfileobj(fi, fo, 1 << 20)
-        os.replace(tmp, destino)
+        if not (a.get("dias") or []):                 # vacio (por ejemplo, un historial que quedo sin dias): se busca otro
+            print(f"  {a['asset']} viene vacio")
+            continue
+        _instalar(gz, a)
+        tienen.add(a["asset"])
         n += 1
         print(f"  {a['asset']} -> data/{a['ruta']} ({a.get('dia') or '-'})")
     print(f"Restaurados {n} archivos del release {man.get('tag')}.")
+    n += _de_releases_anteriores((set(ARCHIVOS) | {ASSET_EMPAREJADO}) - tienen, man.get("tag"))
     return n
 
 
