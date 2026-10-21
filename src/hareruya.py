@@ -154,7 +154,7 @@ def buscar_carta(nombre):
 # ====================================================================================================
 
 
-CARPETA_DATA = Path(__file__).resolve().parent.parent / "data"
+CARPETA_DATA = Path(os.environ.get("STACK_RAIZ") or Path(__file__).resolve().parent.parent) / "data"   # STACK_RAIZ: Stack instalado
 
 # ---------------------------------------------------------------- puntuacion y umbrales
 # Prioridad pedida: numero > set > acabado > nombre. Lo ausente suma 0 (no es contradiccion).
@@ -2317,12 +2317,46 @@ def descargar(n=None, workers=N_WORKERS, pausa=PAUSA_SEGUNDOS, nueva=False):
     return ruta
 
 
+# ----------------------------------------------------------------------------------------------------
+# Hareruya bloquea a los servidores de GitHub: la descarga se hace en tu PC y se sube a la nube (release 'hareruya-pc'
+# de Guayaba7/stack-datos). El workflow diario la toma de ahi en lugar de descargar. Necesita GitHub CLI (gh) con sesion.
+REPO_NUBE, TAG_PC = "Guayaba7/stack-datos", "hareruya-pc"
+
+
+def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
+    """Descarga Hareruya (retoma si quedo a medias) y sube el resultado a la nube para que el workflow lo use."""
+    import subprocess
+    gh = shutil.which("gh")
+    if not gh:
+        sys.exit("Falta GitHub CLI (https://cli.github.com) con sesion:  gh auth login")
+    corre = lambda *a: subprocess.run([gh, *a], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    ruta = descargar()                              # termina la que haya quedado a medias...
+    if dia_de_seco(ruta) != datetime.now().date().isoformat():
+        ruta = descargar(nueva=True)                # ...y si era de otro dia, baja la de hoy
+    meta = meta_seco(ruta)
+    if not meta.get("completo") or not int(meta.get("productos") or 0):
+        sys.exit(f"La descarga no quedo completa ({meta.get('procesadas')}/{meta.get('cartas_plan')} cartas): no se sube.")
+    archivos = [ruta, ruta.with_name(ruta.name.replace(".jsonl.gz", ".meta.json"))]
+    if corre("release", "view", tag, "--repo", repo).returncode != 0:   # pre-release: nunca es el 'latest' de los datos
+        c = corre("release", "create", tag, "--repo", repo, "--prerelease", "--latest=false", "--title", "Hareruya (desde la PC)",
+                  "--notes", "Descarga de Hareruya hecha en la PC (Hareruya bloquea a GitHub). La usa el workflow diario.")
+        if c.returncode != 0:
+            sys.exit("No se pudo crear el release: " + c.stderr.strip())
+    for a in json.loads(corre("release", "view", tag, "--repo", repo, "--json", "assets").stdout or "{}").get("assets", []):
+        if a["name"] not in {x.name for x in archivos}:            # solo queda la de hoy
+            corre("release", "delete-asset", tag, a["name"], "--repo", repo, "--yes")
+    u = corre("release", "upload", tag, *map(str, archivos), "--repo", repo, "--clobber")
+    if u.returncode != 0:
+        sys.exit("No se pudo subir: " + u.stderr.strip())
+    print(f"Subido a la nube ({repo}, {tag}): {ruta.name} | {int(meta['productos']):,} productos", flush=True)
+
+
 # ====================================================================================================
 # F. LINEA DE COMANDOS
 # ====================================================================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="hareruya.py", description="Precios de Hareruya para Stack.")
-    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "emparejar", "detener", "historial"],
+    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "emparejar", "detener", "historial", "nube"],
                     help="descargar (por defecto; retoma la que haya quedado a medias), emparejar (Stack lo hace solo), detener, "
                          "o historial (pasa al historial los emparejados que falten; con --todo empareja tambien las descargas viejas)")
     ap.add_argument("--n", type=int, help="solo N nombres al azar (prueba rapida)")
@@ -2334,6 +2368,8 @@ def main(argv=None):
         CARPETA_SECO.mkdir(parents=True, exist_ok=True)
         (CARPETA_SECO / "DETENER.txt").write_text("detener", encoding="utf-8")
         print("Se pidio detener la descarga: termina la carta en curso y guarda.")
+    elif a.accion == "nube":                        # en tu PC: descargar y subir a la nube (ver subir_a_nube)
+        subir_a_nube()
     elif a.accion == "emparejar":
         ruta = emparejar()
         print(f"Emparejado -> {ruta}")
