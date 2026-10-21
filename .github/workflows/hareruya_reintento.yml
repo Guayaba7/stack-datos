@@ -1,0 +1,51 @@
+# Si hoy no salieron los precios de Hareruya (mantenimiento, bloqueo...), revisa cada hora si ya responde y, en cuanto
+# responde, vuelve a correr "Datos diarios". Si los precios de hoy ya estan, no hace nada (tarda unos segundos).
+name: Hareruya reintento
+
+on:
+  schedule:
+    - cron: "41 12-23,0-5 * * *"   # cada hora de 6:41 am a 11:41 pm de Mexico (despues de la corrida de las 4:17)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write                   # para lanzar "Datos diarios"
+
+env:
+  TZ: America/Mexico_City
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ya estan los de hoy, o ya se esta corriendo?
+        id: hoy
+        run: |
+          mkdir -p ultimo
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir ultimo || true
+          HOY=$(date +%Y-%m-%d)
+          DIA=$(python -c "import json;m=json.load(open('ultimo/manifest.json'));print(next((a.get('dia') or '' for a in m['archivos'] if a['asset']=='hareruya_emparejado.sqlite.gz'),''))" 2>/dev/null || echo "")
+          echo "Hareruya en el ultimo release: ${DIA:-ninguno} (hoy: $HOY)"
+          ACTIVOS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow diario.yml --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [ "$DIA" = "$HOY" ]; then
+            echo "Los precios de Hareruya de hoy ya estan: no hay nada que hacer."
+          elif [ "$ACTIVOS" != "0" ]; then
+            echo "Datos diarios ya se esta corriendo: se espera a que termine."
+          else
+            echo "falta=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Hareruya ya responde?
+        id: probar
+        if: ${{ steps.hoy.outputs.falta == '1' }}
+        run: |
+          pip install -q requests
+          if python src/hareruya.py probar; then echo "responde=1" >> "$GITHUB_OUTPUT"; fi
+      - name: Volver a correr Datos diarios
+        if: ${{ steps.probar.outputs.responde == '1' }}
+        run: gh workflow run diario.yml --repo "$GITHUB_REPOSITORY" -f tiendas=todas
