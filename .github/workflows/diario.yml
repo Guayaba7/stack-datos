@@ -107,7 +107,7 @@ jobs:
       - name: Descargar Hareruya
         if: ${{ steps.pc.outputs.listo != '1' }}
         continue-on-error: true
-        run: python src/hareruya.py descargar --workers 6     # 6 a la vez (16 desde GitHub hace que Hareruya bloquee)
+        run: python src/hareruya.py descargar                 # 16 procesos (lo normal de hareruya.py)
       - name: Revisar que Hareruya si respondio
         id: revisar
         if: ${{ steps.pc.outputs.listo != '1' }}
