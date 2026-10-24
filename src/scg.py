@@ -659,7 +659,9 @@ def catalogo():
         raise RuntimeError(f"No existe {RUTA_HISTORIAL}. Corre scryfall.py primero.")
     con = sqlite3.connect(f"{RUTA_HISTORIAL.resolve().as_uri()}?mode=ro", uri=True)
     try:
-        filas = con.execute("SELECT id, finish, name, set_code, collector_number, price_usd, set_name, lang FROM cards").fetchall()
+        # solo los nombres de la search_list: las fichas, emblemas y Art Series no se buscan (scryfall.py los deja fuera)
+        filas = con.execute("SELECT id, finish, name, set_code, collector_number, price_usd, set_name, lang FROM cards "
+                            "WHERE name IN (SELECT name FROM search_list)").fetchall()
         try:
             dia = con.execute("SELECT MAX(fecha) FROM dias").fetchone()[0]
         except sqlite3.Error:

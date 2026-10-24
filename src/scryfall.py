@@ -326,7 +326,7 @@ def datos_de_carta(carta):
             "rarity": carta.get("rarity"), "lang": carta.get("lang"), "released_at": carta.get("released_at"),
             "scryfall_uri": carta.get("scryfall_uri"), "promo_types": ", ".join(carta.get("promo_types") or []) or None,
             "tratamiento_foil": tratamiento_de(carta, "foil"), "imagen": imagen_de(carta), "legal": legalidad_de(carta),
-            "digital": int(bool(carta.get("digital")))}
+            "digital": int(bool(carta.get("digital"))), "layout": carta.get("layout")}     # layout: no se guarda (solo para la search_list)
 
 
 def procesar(ruta):
@@ -387,10 +387,15 @@ def sets_por_formato(sets):
     return salida
 
 
+# Fichas (Angel, Beast, Treasure...), emblemas y Art Series: siguen en el catalogo con su precio, pero NO se buscan en las
+# tiendas. Su nombre es una palabra suelta ('Angel') que en Hareruya y SCG trae cientos de productos de otras cartas.
+LAYOUTS_NO_SE_BUSCAN = {"token", "double_faced_token", "emblem", "art_series"}
+
+
 def lista_de_busqueda(cartas, versiones):
     """Un renglon por nombre (sin distinguir mayusculas): las tiendas buscan el NOMBRE una vez, no cada version.
     'buscar_como' es el nombre que se teclea en las tiendas: la cara frontal si es de doble cara ('A // B' -> 'A')."""
-    grupos = {}
+    grupos, solo_tokens = {}, {}
     for id_, acabado, precio in sorted(versiones, key=lambda v: (cartas[v[0]]["name"], cartas[v[0]]["released_at"] or "",
                                                               cartas[v[0]]["set_code"] or "", cartas[v[0]]["collector_number"] or "", v[1])):
         nombre = cartas[id_]["name"]
@@ -398,11 +403,13 @@ def lista_de_busqueda(cartas, versiones):
                                                   "normal": False, "foil_o_etched": False})
         g["ids"].add(id_)
         g["versiones"] += 1
+        k = nombre.casefold()
+        solo_tokens[k] = solo_tokens.get(k, True) and cartas[id_].get("layout") in LAYOUTS_NO_SE_BUSCAN
         g["min"], g["max"] = min(g["min"], precio), max(g["max"], precio)
         g["normal"] |= acabado == "nonfoil"
         g["foil_o_etched"] |= acabado in ("foil", "etched")
     filas = [(g["name"], g["name"].split(" // ")[0].strip(), len(g["ids"]), g["versiones"], g["min"], g["max"],
-              int(g["normal"]), int(g["foil_o_etched"])) for g in grupos.values()]
+              int(g["normal"]), int(g["foil_o_etched"])) for k, g in grupos.items() if not solo_tokens.get(k)]
     return sorted(filas, key=lambda f: f[0].casefold())
 
 

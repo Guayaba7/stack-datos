@@ -366,16 +366,19 @@ def abrir_catalogo(ruta):
 
 def cargar_referencia(con, nombre):
     cols = ["cards_rowid", "name", "set_code", "set_name", "collector_number", "finish", "price_usd",
-            "rarity", "lang", "released_at", "id", "oracle_id", "scryfall_uri"]
+            "rarity", "lang", "released_at", "id", "oracle_id", "scryfall_uri", "promo_types"]
+    # promo_types del catalogo: sin el bulk de Scryfall es lo unico que dice si una impresion es prerelease / promo stamped
+    pt = "promo_types" if any(r[1] == "promo_types" for r in con.execute("PRAGMA table_info(cards)")) else "NULL"
     filas = con.execute(
         "SELECT rowid, name, set_code, set_name, collector_number, finish, price_usd, rarity, lang, released_at, "
-        "id, oracle_id, scryfall_uri FROM cards WHERE name = ? COLLATE NOCASE "
+        f"id, oracle_id, scryfall_uri, {pt} FROM cards WHERE name = ? COLLATE NOCASE "
         "ORDER BY released_at, set_code, collector_number, finish", (nombre,)).fetchall()
     refs = []
     for n, f in enumerate(filas, start=1):
         r = dict(zip(cols, f))
         r["ref_id"] = f"R-{n:02d}"
         r["set_code"] = (r["set_code"] or "").casefold()
+        r["promo_types"] = None if pt == "NULL" else [x.strip() for x in (r["promo_types"] or "").split(",") if x.strip()]
         refs.append(r)
     return refs
 
@@ -419,14 +422,15 @@ def construir_candidatos(refs, universo):
                           "collector_number": p["collector_number"], "finish": fin, "en_ref": r is not None,
                           "ref_id": r["ref_id"] if r else None,
                           "precio_scryfall_usd": r["price_usd"] if r else p["precios"].get(fin),
-                          "extra": p["extra"], "nombres": p["nombres"], "cards_rowid": r["cards_rowid"] if r else None})
+                          "extra": p["extra"], "nombres": p["nombres"], "cards_rowid": r["cards_rowid"] if r else None,
+                          "pt_ref": r.get("promo_types") if r else None})
             vistos.add((p["id"], fin))
     for r in refs:  # filas de la referencia que el bulk no listo (o si no hay bulk)
         if (r["id"], r["finish"]) not in vistos:
             cands.append({"id": r["id"], "set_code": r["set_code"], "set_name": r["set_name"],
                           "collector_number": r["collector_number"], "finish": r["finish"], "en_ref": True,
                           "ref_id": r["ref_id"], "precio_scryfall_usd": r["price_usd"], "extra": None,
-                          "nombres": None, "cards_rowid": r["cards_rowid"]})
+                          "nombres": None, "cards_rowid": r["cards_rowid"], "pt_ref": r.get("promo_types")})
     for n, c in enumerate(cands, start=1):
         c["cand_id"] = c["ref_id"] or f"X-{n:02d}"   # R-xx = en la referencia; X-xx = fuera de ella (< $2)
     return cands
@@ -575,13 +579,17 @@ RE_BASURA = re.compile(r"over\s*-?\s*sized?|chibi|sleeves?|deck\s*protectors?|ul
                        r"|alter\s*-?\s*art|\b\d+\s*-?\s*set\b|\bset\s*of\s*\d|\b\d\s*type\s*set", re.I)
 
 
+RE_FICHA_NOMBRE = re.compile(r"\u300a[^\u300b]*\btokens?\s*\u300b", re.I)   # 《Pilot Token》, 《Goat+Bird Token》: fichas
+
+
 def es_basura(fila):
     """True si el producto no es una carta suelta comparable (ver RE_BASURA). Se busca FUERA de los 《nombres》 (una carta
     puede llamarse como una de esas palabras: 'Neyali, Suns' Vanguard') y en card_name, que Hareruya marca: 'Pest/Angel
     Token', '【Art Card】...'."""
     en = re.sub(r"\u300a[^\u300b]*\u300b", " ", str(fila.get("product_name_en") or ""))
     texto = en + " " + str(fila.get("set_code") or "") + " " + str(fila.get("card_name") or "")
-    return RE_BASURA.search(unicodedata.normalize("NFKC", texto)) is not None
+    return RE_BASURA.search(unicodedata.normalize("NFKC", texto)) is not None or \
+        RE_FICHA_NOMBRE.search(str(fila.get("product_name_en") or "")) is not None
 
 
 RE_NO_CARTA = re.compile(r"\b(booster|box|deck|sleeves?|playmat|binder|storage)\b", re.I)
@@ -1123,8 +1131,10 @@ def senal_numero(tokens_validos, cand, p):
     mejor = "contradice"
     for t in tokens_validos:
         dt, st = partir_numero(t)
-        if t == n:
+        if t == n and not (esperados and not st and sc not in esperados):
             r = "coincide"
+        elif t == n:
+            r = "parcial"      # (001) Promo Stamped: el 1 de la carta normal no es el 1p de la promo
         elif dt is None or dt != dc:
             r = "contradice"
         else:
@@ -1174,15 +1184,15 @@ def tipo_cand(c):
     if re.fullmatch(r"\d+z", n):
         t.add("serializada")
     ex = c["extra"]
-    if ex:
-        pt = set(ex["promo_types"])
+    if ex or c.get("pt_ref") is not None:
+        pt = set(ex["promo_types"]) if ex else set(c["pt_ref"])
         if "prerelease" in pt:
             t.add("prerelease")
         if pt & {"promopack", "stamped"}:
             t.add("promo_stamped")
         if "serialized" in pt:
             t.add("serializada")
-        if "judgegift" in pt or "judge" in norm(c.get("set_name")):
+        if "judgegift" in pt or "judge" in norm(c.get("set_name") or ""):
             t.add("judge")
     if es_fnm(c):
         t.add("fnm")
@@ -1205,7 +1215,7 @@ def senal_indicador(p, c):
     if not ind:
         return ("contradice", f"la impresion es promo {sorted(tipos)} y el producto no trae indicador") if tipos \
             else ("ausente", "sin indicador en el producto")
-    if c["extra"] is None and not tipos:
+    if c["extra"] is None and c.get("pt_ref") is None and not tipos:
         return "ausente", "sin campos de variante para comprobar el indicador"
     if ind & tipos:
         return "coincide", f"indicador {sorted(ind)} = tipo de la impresion {sorted(tipos)}"
@@ -1392,6 +1402,34 @@ def texto_cands(evals, n=4):
                       f"{'' if e['cand']['en_ref'] else ' [<$2]'} ({e['score']})" for e in evals[:n])
 
 
+RE_LETRA_VARIANTE = re.compile(r"(?<![a-z0-9'])([a-d])(?![a-z0-9'])")
+RE_SB = re.compile(r"\(\s*sb\s*\)|\bsideboard\b", re.I)
+
+
+def desempatar(p, empatadas):
+    """Varias impresiones empatadas que se distinguen por algo que el producto SI dice. -> (evaluacion, motivo) o None.
+      - sideboard de World Championship: '(SB)' = el numero con 'sb'; sin '(SB)' = el que no lo tiene.
+      - variante de arte con letra: 'Strip Mine C' = 82c (solo si las empatadas son el mismo numero con letras distintas)."""
+    def num(e):
+        return norm_num(e["cand"]["collector_number"]) or ""
+    if any(num(e).endswith("sb") for e in empatadas):
+        sb = bool(RE_SB.search(p["product_name_en_original"] or ""))
+        quedan = [e for e in empatadas if num(e).endswith("sb") == sb]
+        if len(quedan) == 1:
+            return quedan[0], ("sideboard (SB)" if sb else "no es la de sideboard")
+        empatadas = quedan or empatadas
+    bases = {re.sub(r"[a-z]+$", "", num(e)) for e in empatadas}
+    if len(bases) == 1 and all(re.fullmatch(r"\d+[a-d]", num(e)) for e in empatadas):
+        texto = re.sub(r"\u300a[^\u300b]*\u300b|\[[^\]]*\]", " ", norm(p["product_name_en_original"] or ""))
+        letras = set(RE_LETRA_VARIANTE.findall(texto))
+        if len(letras) == 1:
+            l = letras.pop()
+            quedan = [e for e in empatadas if num(e).endswith(l)]
+            if len(quedan) == 1:
+                return quedan[0], f"variante de arte '{l.upper()}'"
+    return None
+
+
 def decidir(p, evals, universo_completo):
     """confirmado / ambiguo / sin_coincidencia, con la candidata elegida, el puntaje y el motivo."""
     d = {"estado": None, "motivo": None, "confianza": None, "cand_id": None, "score": None, "segundo_score": None,
@@ -1466,7 +1504,8 @@ def decidir(p, evals, universo_completo):
         # numero + set + acabado ya identifican la impresion: el 2o nombre (a menudo flavor_name que Scryfall no trae) no la discrimina
         # Doble cara / dos nombres (Strixhaven y similares): basta con que UNO de los nombres sea esta carta si set y acabado la
         # identifican (con o sin numero) y nada en Scryfall contradice al otro nombre.
-        if s["numero"] in ("coincide", "ausente") and s["set"] in ("exacto", "alias", "equiv", "base") and s["acabado"] == "coincide" \
+        if s["numero"] in ("coincide", "ausente") and s["set"] in ("exacto", "alias", "equiv", "base", "base_p", "promo_nombre") \
+                and s["acabado"] == "coincide" \
                 and s["nombre"] in ("parcial", "desconocido") and nombres_compatibles(p, top["cand"]):
             d["alertas"].append("dos nombres: solo uno verificado contra Scryfall; confirmado por numero + set + acabado (" + top["detalle_nombre"] + ")")
         else:
@@ -1503,12 +1542,31 @@ def decidir(p, evals, universo_completo):
                            f"mejor candidata: {top['cand']['set_code']}#{top['cand']['collector_number']} {top['cand']['finish']}"}
     if p["_versiones"] and not any(v in REGLAS_VERSION for v in p["_versiones"]):
         d["alertas"].append(f"tipo de version {p['tipo_version']} conservado; Scryfall no tiene regla para distinguirlo (REGLAS_VERSION)")
-    if s["set"] in ("ausente", "contradice") and not unica:
+    if s["set"] == "ausente" and not unica and universo_completo and not p["_ind"] and len(viables) == 1 \
+            and s["acabado"] == "coincide":
+        # sin set en el titulo ('【Foil】《"Ach! Hans, Run!"》'), pero en TODO Scryfall solo hay una impresion con ese acabado
+        d["alertas"].append("sin set en el producto: es la unica impresion de Scryfall con ese acabado")
+    elif s["set"] in ("ausente", "contradice") and not unica:
         return {**d, "estado": "ambiguo", "motivo": "sin_set", "cand_id": None}
     if s["acabado"] != "coincide":
         return {**d, "estado": "ambiguo", "motivo": "evidencia_minima_incompleta",
                 "detalle": "el acabado no esta identificado sin ambiguedad (" + p["finish_fuente"] + ")", "cand_id": None}
     if len(viables) > 1 and d["margen"] < MARGEN_MIN:
+        elegida = desempatar(p, [e for e in viables if top["score"] - e["score"] < MARGEN_MIN])
+        if elegida is not None:
+            d["alertas"].append(f"desempate: {elegida[1]}")
+            top = elegida[0]
+            d.update(cand_id=top["cand_id"], score=top["score"], margen=MARGEN_MIN, coincidencias=top["coincidencias"])
+            if not top["cand"]["en_ref"]:
+                return {**d, "estado": "sin_coincidencia", "motivo": "fuera_del_universo_2usd"}
+            d["confianza"] = "media"
+            return {**d, "estado": "confirmado", "motivo": "ok"}
+        if p["numero_no_validado"] and not p["numero_validado"] and all(
+                e["senales"]["numero"] == "ausente" for e in viables if top["score"] - e["score"] < MARGEN_MIN):
+            # el producto dice su numero ((156)) y ninguna impresion conocida lo tiene: es otra version (de < $2 o que
+            # Scryfall no lista), no una duda entre las que si estan
+            return {**d, "estado": "sin_coincidencia", "motivo": "numero_no_corresponde", "cand_id": None,
+                    "detalle": f"numero del producto {p['numero_no_validado']}: ninguna impresion del catalogo lo tiene"}
         return {**d, "estado": "ambiguo", "motivo": "varias_candidatas_similares", "cand_id": None}
     if top["score"] < UMBRAL_CONFIRMAR and not unica:
         return {**d, "estado": "ambiguo", "motivo": "puntuacion_insuficiente", "cand_id": None}
@@ -1529,7 +1587,7 @@ def decidir(p, evals, universo_completo):
 
 
 # ---------------------------------------------------------------- version de las reglas
-VERSION_REGLAS_BASE = "2026.10-r2"      # subir a mano cuando cambie la LOGICA (no solo las tablas)
+VERSION_REGLAS_BASE = "2026.10-r3"      # subir a mano cuando cambie la LOGICA (no solo las tablas)
 
 def _canon(x):
     """Representacion estable (independiente del orden de sets/dicts y de la semilla de hash de Python)."""
