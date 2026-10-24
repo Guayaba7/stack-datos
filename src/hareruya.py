@@ -562,13 +562,23 @@ RE_NUMERO = [r"\u300b\s*(\d{1,4}[a-z\u2605]?)(?=\s*[\[\(\uff3b\uff08]|\s*$)",   
 RE_CLAVE_NUMERO = re.compile(r"(collector|card_?no|card_?number|^number$|^no$)", re.I)
 RE_CARAS = re.compile(r"\u300a(.+?)\u300b")                      # 《nombre》
 RE_MARCAS = re.compile(r"[\u25a0\u25c6](.+?)[\u25a0\u25c6]")       # ■Showcase■  ◆Prerelease◆
-# Productos que NO son cartas y que Hareruya mezcla en la busqueda: se tiran (no se guardan ni se muestran).
-RE_BASURA = re.compile(r"over\s*-?\s*sized?|chibi|sleeves?|deck\s*protectors?|ultra\W{0,3}pro|salvat|\btokens?\b|art\s*card", re.I)
+# Productos que NO son cartas sueltas comparables y que Hareruya mezcla en la busqueda: se tiran (no se guardan ni se
+# muestran). Dos grupos:
+#   - no son cartas: oversized, stickers chibi, fundas, Ultra Pro, Salvat, tokens, Art Cards / Art Series (las de 30 yenes
+#     que se confundian con la carta: Urza, Lord High Artificer [MH1]), mini posters, Theme Cards de Jumpstart, Vanguard.
+#   - son cartas pero su precio no es el de una carta suelta NM de la tienda: consignacion (las pone un particular, con
+#     condicion y precio propios), Artist Proof, firmadas, graduadas (CGC / PSA / BGS), con tinta, alteradas y lotes de
+#     varias copias (4Set, Set of 4, 2 type set).
+RE_BASURA = re.compile(r"over\s*-?\s*sized?|chibi|sleeves?|deck\s*protectors?|ultra\W{0,3}pro|salvat|\btokens?\b|art\s*card|art\s*series"
+                       r"|mini\W{0,3}poster|theme\s*card|\bvanguard\b"
+                       r"|consign\w*\s*item|consigent|artist\s*proof|\bsigned\b|\bsign\s*foil|\b(?:cgc|psa|bgs)\s*\d|\binked\b"
+                       r"|alter\s*-?\s*art|\b\d+\s*-?\s*set\b|\bset\s*of\s*\d|\b\d\s*type\s*set", re.I)
 
 
 def es_basura(fila):
-    """Oversized, stickers chibi, fundas, Ultra Pro, Salvat, tokens y Art Cards. Se busca FUERA de los 《nombres》 (una carta
-    puede llamarse como una de esas palabras) y en card_name, que Hareruya marca: 'Pest/Angel Token', '【Art Card】...'."""
+    """True si el producto no es una carta suelta comparable (ver RE_BASURA). Se busca FUERA de los 《nombres》 (una carta
+    puede llamarse como una de esas palabras: 'Neyali, Suns' Vanguard') y en card_name, que Hareruya marca: 'Pest/Angel
+    Token', '【Art Card】...'."""
     en = re.sub(r"\u300a[^\u300b]*\u300b", " ", str(fila.get("product_name_en") or ""))
     texto = en + " " + str(fila.get("set_code") or "") + " " + str(fila.get("card_name") or "")
     return RE_BASURA.search(unicodedata.normalize("NFKC", texto)) is not None
@@ -1519,7 +1529,7 @@ def decidir(p, evals, universo_completo):
 
 
 # ---------------------------------------------------------------- version de las reglas
-VERSION_REGLAS_BASE = "2026.10-r1"      # subir a mano cuando cambie la LOGICA (no solo las tablas)
+VERSION_REGLAS_BASE = "2026.10-r2"      # subir a mano cuando cambie la LOGICA (no solo las tablas)
 
 def _canon(x):
     """Representacion estable (independiente del orden de sets/dicts y de la semilla de hash de Python)."""
@@ -1880,7 +1890,18 @@ def emparejar(ruta_seco=None, carpeta_catalogo=None, workers=None, progreso=None
     total = sum(1 for _ in leer_seco(ruta_seco))
     workers = max(1, min(workers or max(1, min(4, (os.cpu_count() or 2) - 1)), total or 1))
     t0 = time.time()
-    indice_del_dia()                          # se arma UNA vez aqui; los procesos solo lo leen
+    universo = indice_del_dia() is not None  # se arma UNA vez aqui; los procesos solo lo leen
+    if not universo:                          # sin el bulk, las versiones de < $2 no compiten: el emparejado sale incompleto
+        try:
+            import scryfall                   # mismo directorio (src/)
+            if scryfall.asegurar_bulk():
+                universo = indice_del_dia() is not None
+        except Exception as e:                # noqa: BLE001
+            print(f"AVISO: no se pudo conseguir el bulk de Scryfall: {type(e).__name__}: {e}")
+    if not universo:
+        aviso = ("sin el default-cards de Scryfall: se empareja solo contra el catalogo >= $2 (las versiones baratas "
+                 "saldran como 'sin coincidencia' y alguna podria confirmarse con la version cara)")
+        print(f"::warning::{aviso}" if os.environ.get("GITHUB_ACTIONS") else f"AVISO: {aviso}")
     destino = ruta_cache(ruta_seco, carpeta_catalogo)
     destino.parent.mkdir(parents=True, exist_ok=True)
     parciales = [destino.with_name(destino.stem + f".w{w}.part.sqlite") for w in range(workers)]
@@ -1935,7 +1956,7 @@ def emparejar(ruta_seco=None, carpeta_catalogo=None, workers=None, progreso=None
         meta = {"version": VERSION_EMPAREJADO, "reglas": VERSION_REGLAS, "completo": 1, "seco": str(ruta_seco),
                 "firma_seco": firma(ruta_seco), "seco_dia": dia_de_seco(ruta_seco, ms), "seco_completo": int(bool(ms.get("completo"))),
                 "capturado_desde": ms.get("inicio"), "capturado_hasta": ms.get("fin"), "catalogo_dia": carpeta_catalogo.name,
-                "cartas": total, "productos": n_prod, "confirmados": n_conf, "workers": workers,
+                "cartas": total, "productos": n_prod, "confirmados": n_conf, "workers": workers, "universo": int(universo),
                 "segundos": round(time.time() - t0, 1), "emparejado_utc": ahora_utc()}
         out.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [(k, str(v)) for k, v in meta.items()])
         out.commit()

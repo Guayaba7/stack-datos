@@ -19,6 +19,7 @@ Que hace:
      tabla ck_precios de historial.sqlite. Stack lo muestra en el detalle de la carta.
 
 Uso:  python src/mtgjson.py            (descarga si hay version nueva e importa)
+      python src/mtgjson.py nombres    (nombre de cada carta en otros idiomas -> tabla nombres_idioma; busqueda de Stack)
       python src/mtgjson.py --forzar   (importa aunque la comparacion contra tus dias no cuadre)
       python src/mtgjson.py --sin-descargar   (usa lo que ya esta en data/precios/mtgjson)
 Stack lo puede iniciar desde Ctrl+T (TIENDAS) y muestra su avance en la esquina.
@@ -228,6 +229,61 @@ def actualizar_ids(pct0, pct1, sin_descargar=False):
     if not sin_descargar:
         ruta.unlink(missing_ok=True)                  # pesa mucho y ya no hace falta: la equivalencia queda en ids.sqlite
     return n
+
+
+# ---------------------------------------------------------------- nombres de las cartas en otros idiomas (busqueda de Stack)
+IDIOMAS_MTGJSON = {"Spanish": "es", "French": "fr", "German": "de", "Italian": "it", "Portuguese (Brazil)": "pt",
+                   "Japanese": "ja", "Chinese Simplified": "zhs", "Chinese Traditional": "zht", "Korean": "ko", "Russian": "ru"}
+DDL_NOMBRES = """CREATE TABLE IF NOT EXISTS nombres_idioma (   -- nombre oficial de cada carta en otros idiomas (de MTGJSON)
+    name TEXT NOT NULL, idioma TEXT NOT NULL, nombre TEXT NOT NULL, PRIMARY KEY (name, idioma, nombre)) WITHOUT ROWID"""
+
+
+def actualizar_nombres(sin_descargar=False):
+    """Guarda en historial.sqlite (tabla nombres_idioma) el nombre de cada carta de la search_list en cada idioma que
+    trae MTGJSON (AtomicCards: una entrada por carta, con foreignData). Stack los usa para buscar 'Relampago' y encontrar
+    Lightning Bolt. Se reemplaza la tabla completa (o entra todo o no entra nada). -> (cartas con nombre, filas)."""
+    ruta = CARPETA / "AtomicCards.json.xz"
+    if not sin_descargar or not ruta.exists():
+        descargar("AtomicCards.json.xz", ruta, 5, 50)
+    con = scryfall.abrir_historial()
+    try:
+        buscadas = {r[0] for r in con.execute("SELECT name FROM search_list")}
+        buscadas |= {r[0] for r in con.execute("SELECT DISTINCT name FROM cartas")}
+        filas, ultimo = set(), [0.0]
+
+        def al_leer(_):
+            if time.time() - ultimo[0] > 1:
+                ultimo[0] = time.time()
+                avance("descargando", 60, f"leyendo nombres en otros idiomas ({len(filas):,})")
+
+        for nombre, caras in entradas_data(ruta, al_leer):
+            if nombre not in buscadas:
+                continue
+            for cara in caras or []:
+                for fd in (cara or {}).get("foreignData") or []:
+                    idioma = IDIOMAS_MTGJSON.get(fd.get("language"))
+                    if not idioma:
+                        continue
+                    for x in {fd.get("name"), fd.get("faceName")}:
+                        x = (x or "").strip()
+                        if x and x.casefold() != nombre.casefold():
+                            filas.add((nombre, idioma, x))
+        if not filas:
+            raise RuntimeError("AtomicCards no trajo ningun nombre en otro idioma para las cartas del catalogo")
+        con.execute("BEGIN")
+        con.execute(DDL_NOMBRES)
+        con.execute("DELETE FROM nombres_idioma")
+        con.executemany("INSERT OR IGNORE INTO nombres_idioma VALUES (?, ?, ?)", sorted(filas))
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+    if not sin_descargar:
+        ruta.unlink(missing_ok=True)
+    return len({f[0] for f in filas}), len(filas)
 
 
 def borrar_staging():
@@ -524,6 +580,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     _AV["inicio"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     CARPETA.mkdir(parents=True, exist_ok=True)
+    if a.accion == "nombres":                         # python src/mtgjson.py nombres: solo los nombres en otros idiomas
+        cartas, n = actualizar_nombres(a.sin_descargar)
+        avance("terminado", 100, f"nombres en otros idiomas: {cartas:,} cartas, {n:,} nombres")
+        return 0
     RUTA_DETENER.unlink(missing_ok=True)
     lineas = [f"Importacion de MTGJSON  {datetime.now():%Y-%m-%d %H:%M}", ""]
     try:

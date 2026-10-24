@@ -24,10 +24,12 @@ columnas que el antiguo cards_over_2usd.sqlite y muestra el dia mas reciente.
 
 Uso:  python src/scryfall.py                              (el dia de hoy)
       python src/scryfall.py revisar [--dia AAAA-MM-DD] [--sin-red]   (solo vuelve a revisar los precios dudosos)
+      python src/scryfall.py bulk                         (solo deja el default-cards vigente en disco)
 """
 import gzip
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -48,7 +50,7 @@ UMBRAL_USD = 2.0  # se conservan precios >= este valor
 # campo de precio de Scryfall -> acabado
 CAMPOS_PRECIO = {"usd": "nonfoil", "usd_foil": "foil", "usd_etched": "etched"}
 ACABADOS = {"nonfoil": 0, "foil": 1, "etched": 2}
-CARPETA_DATA = Path(__file__).resolve().parent.parent / "data"
+CARPETA_DATA = Path(os.environ.get("STACK_RAIZ") or Path(__file__).resolve().parent.parent) / "data"   # STACK_RAIZ: Stack instalado
 CARPETA_PRECIOS = CARPETA_DATA / "precios"
 CARPETA_SCRYFALL = CARPETA_PRECIOS / "scryfall"           # solo el bulk mas reciente
 CARPETA_VALIDACION = CARPETA_PRECIOS / "validacion"
@@ -221,6 +223,27 @@ def descargar_bulk(info, carpeta):
     return meta
 
 
+def asegurar_bulk(info=None):
+    """Deja en data/precios/scryfall/ el bulk vigente aunque su dia ya este en el historial. Hareruya y StarCityGames lo
+    leen para conocer TODAS las impresiones de cada carta (tambien las de menos de $2): sin el, una version barata no
+    puede competir y el emparejado sale incompleto. -> ruta del bulk valido, o None si no se pudo."""
+    info = info or consultar_scryfall()
+    if info and bulk_valido(CARPETA_SCRYFALL, info["updated_at"]):
+        return CARPETA_SCRYFALL / NOMBRE_BULK
+    if info:
+        try:
+            print("Descargando el bulk (lo necesitan las tiendas para emparejar) ...")
+            descargar_bulk(info, CARPETA_SCRYFALL)
+            return CARPETA_SCRYFALL / NOMBRE_BULK
+        except (requests.RequestException, OSError, BulkInvalido) as e:
+            print(f"\nAVISO: la descarga del bulk fallo ({e}).")
+    if bulk_valido(CARPETA_SCRYFALL):
+        print("AVISO: se usa el ultimo bulk valido que ya estaba descargado.")
+        return CARPETA_SCRYFALL / NOMBRE_BULK
+    print("AVISO: no hay bulk de Scryfall en disco: las tiendas emparejaran sin el indice completo.")
+    return None
+
+
 def obtener_bulk():
     """(ruta del bulk, meta del bulk, como se obtuvo) o None si no hay nada nuevo que cargar. Se detiene si no hay
     ningun bulk valido."""
@@ -229,7 +252,8 @@ def obtener_bulk():
         fecha = fecha_de_bulk(info["updated_at"])
         print(f"Scryfall: '{info.get('name', TIPO_BULK)}' actualizado {info['updated_at']} -> dia {fecha}")
         if dia_cargado(fecha, info["updated_at"]):
-            print(f"El dia {fecha} ya esta en el historial ({RUTA_HISTORIAL}). No hay nada que hacer.")
+            print(f"El dia {fecha} ya esta en el historial ({RUTA_HISTORIAL}). No hay precios nuevos que cargar.")
+            asegurar_bulk(info)          # una corrida repetida (reintento de Hareruya) igual necesita el bulk en disco
             return None
         meta = bulk_valido(CARPETA_SCRYFALL, info["updated_at"])
         if meta:
@@ -306,8 +330,10 @@ def datos_de_carta(carta):
 
 
 def procesar(ruta):
-    """Lee TODO el bulk una vez. -> (cartas {id: datos}, versiones [(id, acabado, precio)], conteos, sets)."""
-    cartas, versiones, c, sets = {}, [], Counter(), {}
+    """Lee TODO el bulk una vez. -> (cartas {id: datos}, versiones [(id, acabado, precio)], conteos, sets, sin_precio).
+    sin_precio = [(id, acabado)] de versiones que existen (Scryfall las lista en 'finishes') pero HOY no traen precio:
+    Stack muestra para ellas el ultimo precio conocido, marcado como del dia anterior."""
+    cartas, versiones, c, sets, sin_precio = {}, [], Counter(), {}, []
     try:
         for carta in leer_cartas(ruta):
             c["leidas"] += 1
@@ -325,6 +351,10 @@ def procesar(ruta):
                     if legal[FORMATOS.index(f)] != "N":
                         s["si"][f] += 1
             precios = carta.get("prices") or {}
+            acabados = set(carta.get("finishes") or [])
+            for campo, acabado in CAMPOS_PRECIO.items():
+                if acabado in acabados and a_precio(precios.get(campo)) is None:
+                    sin_precio.append((carta.get("id"), acabado))
             validos = {campo: a_precio(precios.get(campo)) for campo in CAMPOS_PRECIO}
             validos = {campo: p for campo, p in validos.items() if p is not None}
             for campo, precio in validos.items():
@@ -344,7 +374,7 @@ def procesar(ruta):
                 c["bajo_umbral"] += 1
     except (OSError, EOFError, ValueError, UnicodeDecodeError) as e:
         raise BulkInvalido(f"error leyendo {ruta.name} en el registro {c['leidas'] + 1:,}: {e}") from e
-    return cartas, versiones, c, sets
+    return cartas, versiones, c, sets, sin_precio
 
 
 def sets_por_formato(sets):
@@ -418,6 +448,8 @@ CREATE TABLE IF NOT EXISTS entradas (        -- versiones que entraron a >= umbr
     n INTEGER NOT NULL, acabado INTEGER NOT NULL, dia_entrada INTEGER NOT NULL, centavos_entrada INTEGER,
     dia_confirmada INTEGER, motivo TEXT, estado TEXT NOT NULL, PRIMARY KEY (n, acabado, dia_entrada));
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sin_precio (      -- versiones conocidas (alguna vez >= umbral) que ese dia Scryfall dio SIN precio
+    dia INTEGER NOT NULL, n INTEGER NOT NULL, acabado INTEGER NOT NULL, PRIMARY KEY (dia, n, acabado)) WITHOUT ROWID;
 DROP VIEW IF EXISTS cards;
 CREATE VIEW cards AS                         -- el catalogo del dia mas reciente, con las columnas del antiguo cards_over_2usd
     SELECT c.n * 4 + p.acabado AS rowid, c.name, c.set_code, c.set_name, c.collector_number,
@@ -500,7 +532,7 @@ def agregar_dia(con, ruta_bulk, meta_bulk, origen="", avisar=print):
     fecha = fecha_de_bulk(meta_bulk["updated_at"])
     d = dia_num(fecha)
     avisar(f"Leyendo {ruta_bulk} ...")
-    cartas, versiones, c, sets = procesar(ruta_bulk)
+    cartas, versiones, c, sets, sin_precio = procesar(ruta_bulk)
     if not versiones:
         raise BulkInvalido("ninguna impresion cumplio el corte de precio; eso no es normal")
     errores = verificar(cartas, versiones, c, meta_bulk)
@@ -511,6 +543,7 @@ def agregar_dia(con, ruta_bulk, meta_bulk, origen="", avisar=print):
     try:
         con.execute("BEGIN")
         con.execute("DELETE FROM precios WHERE dia = ?", (d,))
+        con.execute("DELETE FROM sin_precio WHERE dia = ?", (d,))
         con.execute("DELETE FROM dias WHERE dia = ?", (d,))
         cols = ["id", "oracle_id", "name", "set_code", "set_name", "collector_number", "rarity", "lang", "released_at",
                 "scryfall_uri", "promo_types", "tratamiento_foil", "imagen", "legal", "digital"]
@@ -523,6 +556,8 @@ def agregar_dia(con, ruta_bulk, meta_bulk, origen="", avisar=print):
         n_de = dict(con.execute("SELECT id, n FROM cartas"))
         con.executemany("INSERT INTO precios (dia, n, acabado, centavos) VALUES (?, ?, ?, ?)",
                         sorted((d, n_de[i], ACABADOS[a], int(round(p * 100))) for i, a, p in versiones))
+        con.executemany("INSERT OR IGNORE INTO sin_precio (dia, n, acabado) VALUES (?, ?, ?)",     # solo las que ya conocemos
+                        sorted({(d, n_de[i], ACABADOS[a]) for i, a in sin_precio if i in n_de}))
         if es_ultimo:
             con.execute("DELETE FROM search_list")
             con.executemany("INSERT INTO search_list VALUES (?, ?, ?, ?, ?, ?, ?, ?)", lista)
@@ -800,10 +835,13 @@ def main(argv=None):
     import argparse
     argv = sys.argv[1:] if argv is None else list(argv)
     ap = argparse.ArgumentParser(prog="scryfall.py", description="Precios de Scryfall para Stack.")
-    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "revisar"])
+    ap.add_argument("accion", nargs="?", default="descargar", choices=["descargar", "revisar", "bulk"],
+                    help="bulk: solo deja el default-cards vigente en disco (para emparejar tiendas)")
     ap.add_argument("--dia", help="revisar: AAAA-MM-DD (por defecto el mas reciente)")
     ap.add_argument("--sin-red", action="store_true", help="revisar: solo detecta y marca, sin consultar la API")
     a = ap.parse_args(argv)
+    if a.accion == "bulk":
+        sys.exit(0 if asegurar_bulk() else 1)
     if a.accion == "revisar":
         con = abrir_historial()
         try:
