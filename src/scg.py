@@ -484,6 +484,8 @@ def num_coincide(c, q):
         return True
     if set_fichas(q) and a.startswith("t") and norm_num(a[1:]) == b:   # fichas: 'T18' == 18
         return True
+    if b.endswith("z") and a == b[:-1] and re.fullmatch(r"[A-Z0-9]{3}\d", (c.get("sku_set") or "").upper()):
+        return True              # serializada: Scryfall '180z' = SCG MUL3 #180 (la variante del set; se elige en desempatar)
     return False
 
 
@@ -563,6 +565,37 @@ def no_vende(q):
     return next((txt for clave, txt in NO_VENDE if clave.lower() in nombre_set.lower()), None)
 
 
+# promo_types de Scryfall -> tipo de promo en el SKU de SCG (PRM-GMDY_HOU_002 = Game Day de HOU #2)
+TIPO_POR_PROMO = {"prerelease": {"PRE"}, "gameday": {"GMDY"}, "promopack": {"PP"}, "buyabox": {"BAB"}, "release": {"LNCH"},
+                  "draftweekend": {"DRFT"}, "intropack": {"INT"}, "resale": {"RESL"}}
+
+
+def desempatar(q, top, clave_prod):
+    """Varios productos de SCG empatados que SI se distinguen. -> la lista que queda (None = no hay la serializada).
+      - promo: el tipo del SKU (PRE, GMDY, PP, BAB...) debe ser el que dicen los promo_types de Scryfall.
+      - variantes de un set en SCG (MUL2 / MUL3, LTR2 / LTR4, RVR3 / RVR4): la de digito mas alto es la serializada
+        (precio de cientos o miles de dolares). Scryfall '180z' = la mas alta; cualquier otra version = las demas."""
+    variante = lambda x: re.fullmatch(r"([A-Z0-9]{3})(\d)", (x[3].get("sku_set") or "").upper())
+    if str(q["numero"]).lower().endswith("z") and all(variante(x) for x in top) and \
+            len({int(variante(x).group(2)) for x in top}) < 2:
+        return None              # solo hay UNA variante del set: es la normal, no la serializada
+    if len({clave_prod(x[3]) for x in top}) < 2:
+        return top
+    tipos = set().union(*(TIPO_POR_PROMO.get(p, set()) for p in q.get("promo_types") or []))
+    if tipos:
+        quedan = [x for x in top if (x[3].get("sku_tipo") or "").upper() in tipos]
+        if quedan:
+            top = quedan
+    if len({clave_prod(x[3]) for x in top}) > 1 and all(variante(x) for x in top) and len({variante(x).group(1) for x in top}) == 1:
+        digitos = sorted({int(variante(x).group(2)) for x in top})
+        serializada = str(q["numero"]).lower().endswith("z")
+        if len(digitos) < 2:
+            return None if serializada else top
+        quiero = {digitos[-1]} if serializada else set(digitos[:-1])
+        top = [x for x in top if int(variante(x).group(2)) in quiero]
+    return top
+
+
 def emparejar(q, filas):
     """Estado para la version buscada + el producto elegido (NM) + todos los candidatos con su motivo."""
     if not filas:
@@ -584,6 +617,9 @@ def emparejar(q, filas):
     clave_prod = lambda c: ((c.get("sku_tipo") or "").upper(), (c.get("sku_set") or "").upper(), norm_num(c.get("sku_num")),
                             c.get("sku_idioma"), c.get("sku_acabado")) if c.get("sku_set") \
         else (norm(c.get("set")), norm_num(c.get("collector_number")), c.get("idioma"), c.get("finish"))
+    top = desempatar(q, top, clave_prod)
+    if top is None:
+        return "sin_coincidencia", None, cand, "serializada: SCG no tiene la variante serializada de este set"
     productos = {clave_prod(x[3]) for x in top}
     nm = [x for x in top if es_nm(x[3].get("condition"))] or top
     elegido = min(nm, key=lambda x: (x[3].get("price") is None, x[3].get("price") or 0))[3]
@@ -660,7 +696,8 @@ def catalogo():
     con = sqlite3.connect(f"{RUTA_HISTORIAL.resolve().as_uri()}?mode=ro", uri=True)
     try:
         # solo los nombres de la search_list: las fichas, emblemas y Art Series no se buscan (scryfall.py los deja fuera)
-        filas = con.execute("SELECT id, finish, name, set_code, collector_number, price_usd, set_name, lang FROM cards "
+        pt = "promo_types" if any(r[1] == "promo_types" for r in con.execute("PRAGMA table_info(cards)")) else "NULL"
+        filas = con.execute(f"SELECT id, finish, name, set_code, collector_number, price_usd, set_name, lang, {pt} FROM cards "
                             "WHERE name IN (SELECT name FROM search_list)").fetchall()
         try:
             dia = con.execute("SELECT MAX(fecha) FROM dias").fetchone()[0]
@@ -669,7 +706,8 @@ def catalogo():
     finally:
         con.close()
     return [{"id": f[0], "acabado": f[1], "nombre": f[2], "set": (f[3] or "").upper(), "numero": f[4], "tcg_usd": f[5],
-             "set_nombre": f[6], "idioma": f[7] or "en"} for f in filas], dia
+             "set_nombre": f[6], "idioma": f[7] or "en", "promo_types": [x.strip() for x in (f[8] or "").split(",") if x.strip()]}
+            for f in filas], dia
 
 
 def compactar(nombre, filas):
