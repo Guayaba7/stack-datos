@@ -44,6 +44,9 @@ jobs:
       - name: MTGJSON
         continue-on-error: true
         run: python src/mtgjson.py
+      - name: Nombres de las cartas en otros idiomas (para buscar en espanol en Stack)
+        continue-on-error: true
+        run: python src/mtgjson.py nombres
       - name: Card Kingdom
         continue-on-error: true
         run: python src/cardkingdom.py descargar
