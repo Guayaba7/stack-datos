@@ -1,0 +1,51 @@
+# Datos para la pagina web de Stack (GitHub Pages).
+# Corre solo cada vez que termina "Datos diarios", y tambien a mano: pestana Actions > "Datos para la web" > Run workflow.
+# Toma el ultimo release, arma los archivos ligeros (nube.py web) y los publica en https://guayaba7.github.io/stack-datos/datos/
+name: Datos para la web
+
+on:
+  workflow_run:
+    workflows: ["Datos diarios"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  TZ: America/Mexico_City
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  armar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Armar los datos de la web con el ultimo release
+        run: |
+          python .github/nube.py web pagina/datos --bajar
+          rm -rf pagina/_descarga
+          echo "Datos de Stack para la web. La pagina vive en https://guayaba7.github.io/stack-web/" > pagina/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pagina
+
+  publicar:
+    needs: armar
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
