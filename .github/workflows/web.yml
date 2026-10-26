@@ -25,17 +25,31 @@ env:
 jobs:
   armar:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120              # la primera vez el escaner calcula ~38,000 huellas; despues solo las nuevas
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Librerias del escaner
+        run: pip install numpy onnxruntime opencv-python-headless
+      - name: Traer las huellas ya calculadas (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: cache_huellas
+          key: huellas-${{ github.run_id }}
+          restore-keys: huellas-
       - name: Armar los datos de la web con el ultimo release
         run: |
-          python .github/nube.py web pagina/datos --bajar
+          python .github/nube.py web pagina/datos --bajar --huellas cache_huellas
           rm -rf pagina/_descarga
           echo "Datos de Stack para la web. La pagina vive en https://guayaba7.github.io/stack-web/" > pagina/index.html
+      - name: Guardar las huellas para manana
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache_huellas
+          key: huellas-${{ github.run_id }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: pagina
