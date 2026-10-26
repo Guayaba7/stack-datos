@@ -12,7 +12,8 @@ Uso:
     python .github/nube.py publicar SALIDA --tag T --capa DIR [--capa DIR ...]
     python .github/nube.py restaurar DIR         (descomprime en data/ lo que haya en DIR con su manifest.json)
     python .github/nube.py preparar              (igual que el boton de Stack: deja en subir_a_github/ tus datos)
-    python .github/nube.py web SALIDA [--bajar]  (archivos ligeros para la pagina web: manifest + buscar + precios + movers)
+    python .github/nube.py web SALIDA [--bajar] [--huellas CACHE]
+                                                 (archivos de la pagina web; con --huellas tambien el indice del escaner)
 """
 import argparse
 import gzip
@@ -407,8 +408,107 @@ def _pct(hoy, antes):
     return round((hoy - antes) / antes * 100, 1)
 
 
-def web(salida, rutas, usd_mxn=None, jpy_usd=None):
-    """Arma los archivos de la pagina a partir de los sqlite del dia. Devuelve el manifest."""
+# ------------------------------------------------------------------------------------------------------------------
+# Escaner (pagina web): huella de 128 numeros por impresion, calculada con el mismo modelo que corre en el telefono.
+# Se guarda en una cache (CARPETA/huellas.npz) para que cada dia solo se calculen las impresiones nuevas.
+# Librerias extra (solo para esto): numpy, onnxruntime, opencv-python-headless.
+# ------------------------------------------------------------------------------------------------------------------
+MODELO_VISION = "stack-vision-1.onnx"                  # vive junto a nube.py (.github/); el nombre cambia si cambia el modelo
+VISION_CW, VISION_CH = 244, 340
+VISION_ZONA = (0.05, 0.95, 0.04, 0.96)                  # x0, x1, y0, y1: igual que js/escaner.js
+VISION_HILOS = 8
+
+
+def _vision_prep(np, cv2, imgs):
+    mean = np.float32([0.485, 0.456, 0.406]); std = np.float32([0.229, 0.224, 0.225])
+    x0, x1, y0, y1 = VISION_ZONA
+    lote = []
+    for im in imgs:
+        im = cv2.resize(im, (VISION_CW, VISION_CH), interpolation=cv2.INTER_AREA)
+        im = im[int(y0 * VISION_CH):int(y1 * VISION_CH), int(x0 * VISION_CW):int(x1 * VISION_CW)]
+        im = cv2.resize(cv2.cvtColor(im, cv2.COLOR_BGR2RGB), (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
+        lote.append((im - mean) / std)
+    return np.stack(lote).transpose(0, 3, 1, 2).astype(np.float32)
+
+
+def _vision(filas, carpeta_dia, salida, cache):
+    import concurrent.futures as cf
+    import time
+    import urllib.request
+    import numpy as np
+    import cv2
+    import onnxruntime as ort
+    modelo = Path(__file__).resolve().parent / MODELO_VISION
+    if not modelo.is_file():
+        raise FileNotFoundError(f"falta {modelo.name} junto a nube.py")
+    # impresiones (sin importar acabado) con su imagen 'small' de Scryfall; la URL trae la version de la imagen
+    urls = {}
+    for f in filas.values():
+        if f.get("img"):
+            urls[f["sid"]] = f["img"].replace("/normal/", "/small/")
+    cache.mkdir(parents=True, exist_ok=True)
+    ruta_cache = cache / "huellas.npz"
+    vec, version = {}, {}
+    if ruta_cache.is_file():
+        z = np.load(ruta_cache, allow_pickle=False)
+        if str(z["modelo"]) == MODELO_VISION:
+            for sid, u, v in zip(z["ids"], z["urls"], z["vec"]):
+                vec[str(sid)], version[str(sid)] = v, str(u)
+    faltan = [sid for sid, u in urls.items() if version.get(sid) != u]
+    print(f"  Escaner: {len(urls):,} impresiones · {len(urls) - len(faltan):,} ya calculadas · {len(faltan):,} nuevas", flush=True)
+    if faltan:
+        sesion = ort.InferenceSession(str(modelo), providers=["CPUExecutionProvider"])
+        entrada = sesion.get_inputs()[0].name
+
+        def bajar(sid):
+            for intento in range(4):
+                try:
+                    pedido = urllib.request.Request(urls[sid], headers={"User-Agent": "stack-datos"})
+                    with urllib.request.urlopen(pedido, timeout=30) as r:
+                        im = cv2.imdecode(np.frombuffer(r.read(), np.uint8), cv2.IMREAD_COLOR)
+                    if im is not None:
+                        return sid, im
+                except Exception:
+                    time.sleep(2 + 3 * intento)
+            return sid, None
+
+        t0, hechas, fallas = time.time(), 0, 0
+        with cf.ThreadPoolExecutor(VISION_HILOS) as ex:
+            for i in range(0, len(faltan), 256):
+                bloque = [x for x in ex.map(bajar, faltan[i:i + 256])]
+                buenas = [(sid, im) for sid, im in bloque if im is not None]
+                fallas += len(bloque) - len(buenas)
+                for j in range(0, len(buenas), 32):
+                    parte = buenas[j:j + 32]
+                    out = sesion.run(None, {entrada: _vision_prep(np, cv2, [im for _, im in parte])})[0]
+                    out /= np.linalg.norm(out, axis=1, keepdims=True)
+                    for (sid, _), v in zip(parte, out):
+                        vec[sid] = np.clip(np.round(v * 127), -127, 127).astype(np.int8)
+                        version[sid] = urls[sid]
+                hechas += len(buenas)
+                if (i // 256) % 20 == 0:
+                    print(f"    {hechas:,}/{len(faltan):,} ({time.time() - t0:.0f} s)", flush=True)
+        print(f"  Escaner: {hechas:,} calculadas en {time.time() - t0:.0f} s, {fallas} imagenes no bajaron", flush=True)
+        ids_c = sorted(vec)
+        np.savez(ruta_cache, modelo=np.array(MODELO_VISION), ids=np.array(ids_c),
+                 urls=np.array([version[k] for k in ids_c]), vec=np.stack([vec[k] for k in ids_c]))
+    ids = sorted(sid for sid in urls if sid in vec)
+    if not ids:
+        return None
+    m = np.stack([vec[sid] for sid in ids]).astype(np.int8)
+    (carpeta_dia / "vision.bin").write_bytes(m.tobytes())
+    _json_compacto(carpeta_dia / "vision.json", {"esquema": 1, "modelo": MODELO_VISION, "dims": int(m.shape[1]), "ids": ids})
+    destino = salida / "modelo" / MODELO_VISION
+    if not destino.is_file() or destino.stat().st_size != modelo.stat().st_size:
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(modelo, destino)
+    print(f"  Escaner: indice de {len(ids):,} impresiones ({m.nbytes / 1e6:.1f} MB)", flush=True)
+    return {"modelo": f"modelo/{MODELO_VISION}", "dims": int(m.shape[1]), "cartas": len(ids)}
+
+
+def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
+    """Arma los archivos de la pagina a partir de los sqlite del dia. Devuelve el manifest.
+    huellas: carpeta de cache del escaner (si se pasa, se arma el indice visual vision.bin)."""
     from datetime import date, timedelta
     salida = Path(salida)
     rutas = {k: (Path(v) if v else None) for k, v in rutas.items()}
@@ -614,6 +714,16 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None):
         "nuevas": nuevas[:MOVERS_MAX]})
     archivos.append({"nombre": "movers.json", "bytes": b, "sha256": sha})
 
+    # --- 5b) Escaner: huella visual de cada impresion (opcional; solo si hay cache y librerias) ---------------------
+    vision = None
+    if huellas:
+        try:
+            vision = _vision(filas, carpeta, salida, Path(huellas))
+        except ImportError as e:
+            print(f"  (escaner: falta una libreria ({e.name}); se publica sin indice visual)")
+        except Exception as e:                                    # el escaner nunca tumba los precios del dia
+            print(f"  (escaner: fallo {e.__class__.__name__}: {e}; se publica sin indice visual)")
+
     # --- 6) Dias que se quedan y manifest (al final: si algo fallo antes, el manifest viejo sigue apuntando al bueno) --
     guardados = sorted((p.name for p in salida.iterdir() if p.is_dir() and PATRON_DIA.match(p.name)), reverse=True)
     for viejo in guardados[DIAS_WEB:]:
@@ -623,6 +733,8 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None):
         "dias": guardados[:DIAS_WEB], "min_web": 1, "tc": _cambio(salida, usd_mxn, jpy_usd),
         "fuentes": fuentes, "archivos": archivos, "trozos": 256,
     }
+    if vision:
+        man["vision"] = vision
     _json_compacto(salida / "manifest.json", man)
     print(f"Listo: {salida} (dia {dia}) · buscar.json {archivos[0]['bytes'] / 1e6:.1f} MB · "
           f"precios {total_p / 1e6:.1f} MB en 256 trozos · USD->MXN {man['tc'].get('usd_mxn')}")
@@ -645,12 +757,13 @@ def main(argv=None):
     p.add_argument("--bajar", action="store_true", help="usar el ultimo release de stack-datos en vez de data/ local")
     p.add_argument("--usd-mxn", type=float, help="tipo de cambio a mano (si no, se busca en internet)")
     p.add_argument("--jpy-usd", type=float, help="tipo de cambio a mano (si no, se busca en internet)")
+    p.add_argument("--huellas", help="carpeta de cache del escaner; si se da, se arma el indice visual (vision.bin)")
     a = ap.parse_args(argv)
     if a.accion == "web":
         if a.bajar:
-            web(a.salida, _bajar_release(Path(a.salida).resolve().parent / "_descarga"), a.usd_mxn, a.jpy_usd)
+            web(a.salida, _bajar_release(Path(a.salida).resolve().parent / "_descarga"), a.usd_mxn, a.jpy_usd, a.huellas)
         else:
-            web(a.salida, _rutas_locales(), a.usd_mxn, a.jpy_usd)
+            web(a.salida, _rutas_locales(), a.usd_mxn, a.jpy_usd, a.huellas)
         return 0
     if a.accion == "preparar":
         salida = Path(a.salida)
