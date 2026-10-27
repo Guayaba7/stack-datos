@@ -535,10 +535,23 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
             "SELECT n, id, name, set_code, set_name, collector_number, rarity, lang, scryfall_uri, imagen FROM cartas"):
         cartas[n] = {"sid": sid, "nombre": nombre, "set": sc, "set_nombre": sn, "num": num, "rareza": rar,
                      "idioma": lang, "url_scryfall": (uri or "").split("?")[0] or None, "img": img}
-    alias_es = {}
+    # nombres en otros idiomas (MTGJSON): espanol primero (nombre_es de la ficha), luego frances, aleman, italiano y
+    # portugues (letras latinas: los lee el escaner y la busqueda) y japones aparte (sin normalizar: el escaner lo lee
+    # con su propio lector de texto y la busqueda lo compara tal cual)
+    alias_es, alias_latinos, alias_ja = {}, {}, {}
     try:
-        for name, nombre in con.execute("SELECT name, nombre FROM nombres_idioma WHERE idioma = 'es'"):
-            alias_es.setdefault(name, []).append(nombre)
+        for name, idioma, nombre in con.execute(
+                "SELECT name, idioma, nombre FROM nombres_idioma WHERE idioma IN ('es', 'fr', 'de', 'it', 'pt', 'ja') "
+                "ORDER BY name, CASE idioma WHEN 'es' THEN 0 ELSE 1 END, idioma, nombre"):
+            if idioma == "es":
+                alias_es.setdefault(name, []).append(nombre)
+            if idioma == "ja":
+                import unicodedata
+                ja = "".join(unicodedata.normalize("NFKC", nombre).split())
+                if ja:
+                    alias_ja.setdefault(name, []).append(ja)
+            else:
+                alias_latinos.setdefault(name, []).append(nombre)
     except sqlite3.Error:
         pass
     try:
@@ -653,7 +666,7 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         shutil.rmtree(carpeta)
     archivos = []
 
-    # buscar.json: nombres (+ alias en espanol) -> impresiones. Impresiones ordenadas por precio TCG, mayor primero.
+    # buscar.json: nombres (+ alias en es/fr/de/it/pt y, aparte, japones) -> impresiones. Impresiones ordenadas por precio TCG, mayor primero.
     grupos = {}
     for k, f in filas.items():
         grupos.setdefault(f["nombre"], []).append(k)
@@ -665,13 +678,18 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
             f = filas[k]
             con_dato = "".join(l for campo, l in letras if (f.get(campo) or {}).get("estado") in ("ok", "previo"))
             idx.append(len(imp))
-            imp.append([k, f["set"], f["num"], f["acab"], f["idioma"], f["tcg"]["usd"], con_dato])
-        textos = [normalizar(nombre)] + [normalizar(a) for a in alias_es.get(nombre, [])]
+            val = lambda campo, m: (f.get(campo) or {}).get(m) if (f.get(campo) or {}).get("estado") in ("ok", "previo") else None
+            imp.append([k, f["set"], f["num"], f["acab"], f["idioma"], f["tcg"]["usd"], con_dato,
+                        val("har", "jpy"), val("scg", "usd"), val("ck", "usd")])   # fuente preferida en la pagina
+        textos = [normalizar(nombre)] + [normalizar(a) for a in alias_latinos.get(nombre, [])]
         textos = list(dict.fromkeys(t for t in textos if t))
-        nombres.append([nombre, "|".join(textos), idx])
+        fila_n = [nombre, "|".join(textos), idx]
+        if alias_ja.get(nombre):
+            fila_n.append("|".join(dict.fromkeys(alias_ja[nombre])))      # 4a columna: nombres en japones
+        nombres.append(fila_n)
     b, sha = _json_compacto(carpeta / "buscar.json", {
         "esquema": ESQUEMA_WEB, "dia": dia, "nombres": nombres,
-        "imp_cols": ["k", "set", "num", "acab", "idioma", "tcg_usd", "fuentes"], "imp": imp})
+        "imp_cols": ["k", "set", "num", "acab", "idioma", "tcg_usd", "fuentes", "har_jpy", "scg_usd", "ck_usd"], "imp": imp})
     archivos.append({"nombre": "buscar.json", "bytes": b, "sha256": sha})
 
     # p/xx.json: los 256 trozos, aunque alguno quede vacio
