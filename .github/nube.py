@@ -9,13 +9,15 @@ No es un programa de precios: es la herramienta del workflow (vive en .github/, 
 La primera subida desde tu PC la hace Stack (CONFIGURACION > NUBE > Preparar primera subida), con el mismo formato.
 
 Uso:
-    python .github/nube.py publicar SALIDA --tag T --capa DIR [--capa DIR ...]
+    python .github/nube.py publicar SALIDA --tag T --capa DIR [--capa DIR ...] [--anterior DIR]
+                                                 (--anterior: el release de ayer ya bajado; con el se arman los parches)
     python .github/nube.py restaurar DIR         (descomprime en data/ lo que haya en DIR con su manifest.json)
     python .github/nube.py preparar              (igual que el boton de Stack: deja en subir_a_github/ tus datos)
     python .github/nube.py web SALIDA [--bajar] [--huellas CACHE]
                                                  (archivos de la pagina web; con --huellas tambien el indice del escaner)
 """
 import argparse
+import bisect
 import gzip
 import hashlib
 import json
@@ -132,14 +134,260 @@ def copia_consistente(origen, destino):
         src.close()
 
 
-def comprimir(origen, destino):
-    """sqlite -> .gz; devuelve (bytes del sqlite, bytes del gz, sha256 del gz)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        copia = Path(tmp) / "copia.sqlite"
-        copia_consistente(origen, copia)
-        crudo = copia.stat().st_size
-        with open(copia, "rb") as fi, gzip.open(destino, "wb", compresslevel=6) as fo:
-            shutil.copyfileobj(fi, fo, 1 << 20)
+# ------------------------------------------------------------------------------------------------------------------
+# Historiales compactos (desde la app S-0.7.6): solo se guarda una fila cuando algo CAMBIA.
+#   - Un dia que esta en la tabla `compacto` solo trae lo que cambio ese dia; una llave sin fila sigue con su valor anterior.
+#   - Un dia que NO esta en `compacto` es un dia completo (como siempre): una llave sin fila ese dia no existia.
+#   - Una "tumba" (la columna marca = -1) en un dia compacto dice "desde este dia ya no existe".
+# Asi un archivo mezcla dias compactos y completos: el dia nuevo que agrega cada tienda llega completo y aqui se compacta.
+# Los programas de las tiendas no cambian (solo escriben el dia nuevo; nunca leen dias anteriores).
+# ------------------------------------------------------------------------------------------------------------------
+TABLA_COMPACTO = "compacto"
+COMPACTAR = {        # asset -> como compactarlo
+    "scg.sqlite.gz": {"tabla": "historial", "dia": "dia", "llaves": ["scryfall_id", "acabado"], "valores": ["precio_usd", "stock"],
+                      "precio": ["precio_usd"], "tumba": {"precio_usd": None, "stock": -1}, "marca": "stock",
+                      "pk": ["scryfall_id", "acabado", "dia"], "completos": 0},
+    "ck.sqlite.gz": {"tabla": "historial", "dia": "dia", "llaves": ["scryfall_id", "acabado"],
+                     "valores": ["venta", "stock", "compra", "quiere"], "precio": ["venta", "compra"],
+                     "tumba": {"venta": None, "stock": -1, "compra": None, "quiere": None}, "marca": "stock",
+                     "pk": ["scryfall_id", "acabado", "dia"], "completos": 0},
+    "hareruya_historial.sqlite.gz": {"tabla": "precios", "dia": "dia", "llaves": ["scryfall_id", "acabado", "idioma", "condicion"],
+                                     "valores": ["jpy", "stock", "ofertas"], "precio": ["jpy"],
+                                     "tumba": {"jpy": 0, "stock": -1, "ofertas": 0}, "marca": "stock",
+                                     "quitar_indices": ["idx_hh_dia"], "completos": 0},
+}
+# El historial de Scryfall NO se compacta en la nube (scryfall.py y mtgjson.py corrigen dias anteriores): se publica completo
+# (para el workflow y para la PC principal) y ADEMAS una copia compacta para las demas computadoras.
+ASSET_HIST_COMPACTO = "historial_compacto.sqlite.gz"
+SPEC_SCRYFALL = {"tabla": "precios", "dia": "dia", "llaves": ["n", "acabado"], "valores": ["centavos"], "precio": ["centavos"],
+                 "tumba": {"centavos": -1}, "marca": "centavos", "completos": 20}    # los 20 dias mas nuevos quedan completos
+STOCK_DIAS = None      # None: el stock se guarda cada dia para siempre. N: mas atras de N dias, solo cuando cambia el precio
+PARCHES_POR_ARCHIVO = 6   # los releases que se quedan (7) menos el de hoy
+PARCHE_MAX = 0.4          # un parche mas grande que el 40% del archivo no vale la pena: se baja completo
+
+
+def _dias_compactos(con):
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (TABLA_COMPACTO,)).fetchone():
+        return set()
+    return {r[0] for r in con.execute(f"SELECT dia FROM {TABLA_COMPACTO}")}
+
+
+def compactar(con, spec, stock_dias=STOCK_DIAS):
+    """Compacta la tabla (la conexion debe estar en una transaccion). -> (filas antes, filas despues)."""
+    t, dc, ks, vs = spec["tabla"], spec["dia"], spec["llaves"], spec["valores"]
+    dias = sorted(r[0] for r in con.execute("SELECT dia FROM dias"))
+    ya = _dias_compactos(con)
+    completos_in = [d for d in dias if d not in ya]
+    quedan = set(completos_in[-spec["completos"]:]) if spec["completos"] else set()
+    corte = dias[-stock_dias] if stock_dias and len(dias) > stock_dias else None    # antes de este dia: solo cambios de precio
+    tumba = tuple(spec["tumba"][v] for v in vs)
+    i_marca = vs.index(spec["marca"])
+    i_precio = [vs.index(c) for c in spec.get("precio", vs)]
+    nk = len(ks)
+    antes = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+
+    def primer_completo(desde, hasta):
+        i = bisect.bisect_right(completos_in, desde)
+        if i < len(completos_in) and (hasta is None or completos_in[i] < hasta):
+            return completos_in[i]
+        return None
+
+    salida = []
+    act, estado, ultimo = None, None, None
+
+    def cerrar():
+        if estado is not None:
+            f = primer_completo(ultimo, None)
+            if f is not None and f not in quedan:
+                salida.append((*act, f, *tumba))
+
+    for fila in con.execute(f"SELECT {', '.join(ks + [dc] + vs)} FROM {t} ORDER BY {', '.join(ks)}, {dc}"):
+        llave, d, vals = fila[:nk], fila[nk], tuple(fila[nk + 1:])
+        if llave != act:
+            if act is not None:
+                cerrar()
+            act, estado, ultimo = llave, None, None
+        if estado is not None:
+            f = primer_completo(ultimo, d)
+            if f is not None:                       # un dia completo sin esta llave: ahi dejo de existir
+                if f not in quedan:
+                    salida.append((*llave, f, *tumba))
+                estado = None
+        nuevo = None if vals[i_marca] == -1 else vals
+        if d in quedan:
+            if nuevo is not None:
+                salida.append((*llave, d, *vals))
+            estado = nuevo
+        elif nuevo != estado:
+            if (corte is not None and d < corte and nuevo is not None and estado is not None
+                    and all(nuevo[i] == estado[i] for i in i_precio)):
+                pass                                # solo cambio el stock, hace mas de STOCK_DIAS: no se guarda
+            else:
+                salida.append((*llave, d, *(tumba if nuevo is None else vals)))
+                estado = nuevo
+        ultimo = d
+    if act is not None:
+        cerrar()
+
+    info = list(con.execute(f"PRAGMA table_info({t})"))
+    orden = [r[1] for r in info]
+    pos = {c: i for i, c in enumerate(ks + [dc] + vs)}
+    filas = [tuple(r[pos[c]] if c in pos else None for c in orden) for r in salida]
+    if spec.get("pk"):                       # sin rowid y con la llave por carta: la mitad de tamano y busquedas por carta rapidas
+        defs = ", ".join(f"{r[1]} {r[2]}{' NOT NULL' if r[3] else ''}" for r in info)
+        con.execute(f"DROP TABLE {t}")
+        con.execute(f"CREATE TABLE {t} ({defs}, PRIMARY KEY ({', '.join(spec['pk'])})) WITHOUT ROWID")
+    else:
+        con.execute(f"DELETE FROM {t}")
+    for ix in spec.get("quitar_indices", []):
+        con.execute(f"DROP INDEX IF EXISTS {ix}")
+    con.executemany(f"INSERT INTO {t} ({', '.join(orden)}) VALUES ({', '.join('?' * len(orden))})", filas)
+    con.execute(f"CREATE TABLE IF NOT EXISTS {TABLA_COMPACTO} (dia PRIMARY KEY)")
+    con.execute(f"DELETE FROM {TABLA_COMPACTO}")
+    con.executemany(f"INSERT INTO {TABLA_COMPACTO} VALUES (?)", [(d,) for d in dias if d not in quedan])
+    return antes, len(filas)
+
+
+def compactar_archivo(ruta, spec, stock_dias=STOCK_DIAS):
+    con = sqlite3.connect(ruta)
+    try:
+        con.execute("BEGIN")
+        r = compactar(con, spec, stock_dias)
+        con.execute("COMMIT")
+        con.execute("VACUUM")
+        return r
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def leer_compacto(con, tabla, llaves, valores, marca, desde=None, hasta=None, donde="", params=()):
+    """{llave: [(dia, *valores), ...]} con el valor de CADA dia en que existio (sirve igual para archivos completos).
+    desde/hasta: solo esos dias (inclusive). donde: filtro SQL extra sobre la tabla."""
+    dias = sorted(r[0] for r in con.execute("SELECT dia FROM dias"))
+    comp = _dias_compactos(con)
+    completos = {d for d in dias if d not in comp}
+    i_marca = valores.index(marca)
+    filas = {}
+    for f in con.execute(f"SELECT {', '.join(llaves)}, dia, {', '.join(valores)} FROM {tabla} {donde}", params):
+        filas.setdefault(f[:len(llaves)], {})[f[len(llaves)]] = f[len(llaves) + 1:]
+    out = {}
+    for k, por_dia in filas.items():
+        estado, serie = None, []
+        for d in dias:
+            v = por_dia.get(d)
+            if v is not None:
+                estado = None if v[i_marca] == -1 else v
+            elif d in completos:
+                estado = None
+            if estado is not None and (desde is None or d >= desde) and (hasta is None or d <= hasta):
+                serie.append((d, *estado))
+        if serie:
+            out[k] = serie
+    return out
+
+
+# ---------------------------------------------------------------- parches: lo que cambio entre dos versiones de un archivo
+def _tablas(con, esquema="main"):
+    return {r[0]: r[1] for r in con.execute(
+        f"SELECT name, sql FROM {esquema}.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")}
+
+
+def _pk(con, tabla, esquema="main"):
+    return [c for _, c in sorted((r[5], r[1]) for r in con.execute(f'PRAGMA {esquema}.table_info("{tabla}")') if r[5])]
+
+
+def conteos(ruta):
+    con = abrir_ro(ruta)
+    try:
+        return {t: con.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in sorted(_tablas(con))}
+    finally:
+        con.close()
+
+
+def hacer_parche(viejo, nuevo, salida):
+    """Archivo sqlite con lo que hay que quitar (llaves) y poner (filas) para pasar de VIEJO a NUEVO.
+    -> {"poner", "quitar"} o None si cambio la estructura (entonces hay que bajar el archivo completo)."""
+    con = sqlite3.connect(salida)
+    try:
+        con.execute("ATTACH DATABASE ? AS v", (str(viejo),))
+        con.execute("ATTACH DATABASE ? AS n", (str(nuevo),))
+        tn = _tablas(con, "n")
+        if _tablas(con, "v") != tn:
+            return None
+        con.execute("CREATE TABLE parche_meta (key TEXT PRIMARY KEY, value TEXT)")
+        res = {"poner": 0, "quitar": 0}
+        for i, t in enumerate(sorted(tn)):
+            pk = _pk(con, t, "n")
+            if not pk:
+                return None
+            lista = ", ".join(f'"{r[1]}"' for r in con.execute(f'PRAGMA n.table_info("{t}")'))
+            lpk = ", ".join(f'"{c}"' for c in pk)
+            con.execute(f'CREATE TABLE p{i} AS SELECT {lista} FROM n."{t}" EXCEPT SELECT {lista} FROM v."{t}"')
+            con.execute(f'CREATE TABLE q{i} AS SELECT {lpk} FROM (SELECT {lista} FROM v."{t}" EXCEPT SELECT {lista} FROM n."{t}")')
+            res["poner"] += con.execute(f"SELECT COUNT(*) FROM p{i}").fetchone()[0]
+            res["quitar"] += con.execute(f"SELECT COUNT(*) FROM q{i}").fetchone()[0]
+            con.execute("INSERT INTO parche_meta VALUES (?, ?)", (f"t{i}", t))
+        con.commit()
+        con.execute("DETACH v")
+        con.execute("DETACH n")
+        con.execute("VACUUM")
+        return res
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- tipo y color de cada impresion (para los filtros)
+TIPOS_BITS = (("Land", 1), ("Creature", 2), ("Instant", 4), ("Sorcery", 8), ("Artifact", 16), ("Enchantment", 32),
+              ("Planeswalker", 64), ("Battle", 128), ("Legendary", 256))
+RE_ID_BULK = re.compile(r'"id"\s*:\s*"([0-9a-f\-]{36})"')
+
+
+def agregar_atributos(ruta_hist, bulk):
+    """Tabla atributos(n, tipos, colores) en el historial: tipos = suma de TIPOS_BITS; colores = WUBRG de la carta
+    (en las tierras sin color, los colores del mana que producen). Sale del default-cards de Scryfall del dia."""
+    if not bulk or not Path(bulk).is_file():
+        print("  (sin default-cards de Scryfall: el historial se publica sin tipo/color)")
+        return 0
+    con = sqlite3.connect(ruta_hist)
+    try:
+        ids = dict(con.execute("SELECT id, n FROM cartas"))
+        filas = []
+        with gzip.open(bulk, "rt", encoding="utf-8") as f:
+            for linea in f:
+                m = RE_ID_BULK.search(linea[:400])
+                if not m or m.group(1) not in ids:
+                    continue
+                try:
+                    c = json.loads(linea.strip().rstrip(","))
+                except ValueError:
+                    continue
+                caras = c.get("card_faces") or []
+                tipo = c.get("type_line") or " // ".join(x.get("type_line") or "" for x in caras)
+                bits = sum(b for palabra, b in TIPOS_BITS if re.search(rf"\b{palabra}\b", tipo))
+                col = set(c.get("colors") or [])
+                for x in caras:
+                    col |= set(x.get("colors") or [])
+                if not col and bits & 1:
+                    col = set(c.get("produced_mana") or []) & set("WUBRG")
+                filas.append((ids[c["id"]], bits, "".join(x for x in "WUBRG" if x in col)))
+        con.execute("DROP TABLE IF EXISTS atributos")
+        con.execute("CREATE TABLE atributos (n INTEGER PRIMARY KEY, tipos INTEGER NOT NULL, colores TEXT NOT NULL) WITHOUT ROWID")
+        con.executemany("INSERT OR REPLACE INTO atributos VALUES (?, ?, ?)", filas)
+        con.commit()
+        return len(filas)
+    finally:
+        con.close()
+
+
+def _gz(sqlite_, destino):
+    """sqlite ya listo -> .gz; devuelve (bytes del sqlite, bytes del gz, sha256 del gz)."""
+    crudo = Path(sqlite_).stat().st_size
+    with open(sqlite_, "rb") as fi, gzip.open(destino, "wb", compresslevel=6) as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
     h = hashlib.sha256()
     with open(destino, "rb") as f:
         for bloque in iter(lambda: f.read(1 << 20), b""):
@@ -147,35 +395,134 @@ def comprimir(origen, destino):
     return crudo, Path(destino).stat().st_size, h.hexdigest()
 
 
-def publicar(salida, tag, capas):
-    """Junta lo mas nuevo de las capas (la ultima gana) y deja en SALIDA los .gz + manifest.json."""
+def comprimir(origen, destino):
+    """sqlite -> .gz (copia consistente, aunque este abierto); devuelve (bytes del sqlite, bytes del gz, sha256 del gz)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copia = Path(tmp) / "copia.sqlite"
+        copia_consistente(origen, copia)
+        return _gz(copia, destino)
+
+
+def _degz(gz, destino):
+    with gzip.open(gz, "rb") as fi, open(destino, "wb") as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+
+
+def _bulk_de(datas):
+    for d in reversed(datas):
+        b = d / "precios" / "scryfall" / "default-cards.jsonl.gz"
+        if b.is_file():
+            return b
+    return None
+
+
+def publicar(salida, tag, capas, anterior=None):
+    """Junta lo mas nuevo de las capas (la ultima gana) y deja en SALIDA los .gz + manifest.json.
+    manifest["archivos"]: lo que bajan Stack <= 0.7.5 y el workflow (historial de Scryfall completo; tiendas compactas).
+    manifest["v2"]: lo que baja Stack 0.7.6+: los mismos archivos + el historial compacto, con su version y los parches
+    (lo que cambio de un release al siguiente) para bajar solo eso."""
     salida = Path(salida)
     salida.mkdir(parents=True, exist_ok=True)
     datas = [Path(c) / "data" for c in capas]
     man = {"esquema": ESQUEMA, "tag": tag, "generado_utc": ahora_utc(), "archivos": []}
-    for asset, (ruta, consulta) in ARCHIVOS.items():
-        # de todas las capas, la que trae MAS (dia mas nuevo, luego mas dias); en empate gana la ultima. Asi una tienda que
-        # fallo (por ejemplo, un historial que quedo vacio) nunca tapa lo bueno que ya habia.
-        opciones = [(dias_de(d / ruta, consulta), k, d / ruta) for k, d in enumerate(datas) if (d / ruta).is_file()]
-        if not opciones:
-            print(f"  (sin {ruta}: no se publica)")
-            continue
-        dias, _, origen = max(opciones, key=lambda o: ((o[0][-1] if o[0] else ""), len(o[0]), o[1]))
-        crudo, comp, sha = comprimir(origen, salida / asset)
-        man["archivos"].append({"asset": asset, "ruta": ruta, "dias": dias, "dia": dias[-1] if dias else None,
-                                "bytes": crudo, "gz_bytes": comp, "sha256": sha})
-        print(f"  {asset:32} {comp / 1e6:8.1f} MB  dias: {len(dias)} ({dias[-1] if dias else '-'})")
-    ruta_emp, dia_emp = emparejado_mas_reciente([d / CARPETA_EMPAREJADO for d in datas])
-    if ruta_emp is not None:
-        crudo, comp, sha = comprimir(ruta_emp, salida / ASSET_EMPAREJADO)
-        man["archivos"].append({"asset": ASSET_EMPAREJADO, "ruta": f"{CARPETA_EMPAREJADO}/{ruta_emp.name}", "dias": [dia_emp],
-                                "dia": dia_emp, "bytes": crudo, "gz_bytes": comp, "sha256": sha})
-        print(f"  {ASSET_EMPAREJADO:32} {comp / 1e6:8.1f} MB  dia: {dia_emp}")
+    v2 = []                                   # entradas de la app nueva
+    listos = {}                               # asset -> sqlite ya preparado (para armar los parches)
+    tmp = Path(tempfile.mkdtemp(prefix="nube_"))
+    try:
+        for asset, (ruta, consulta) in ARCHIVOS.items():
+            # de todas las capas, la que trae MAS (dia mas nuevo, luego mas dias); en empate gana la ultima. Asi una tienda
+            # que fallo (por ejemplo, un historial que quedo vacio) nunca tapa lo bueno que ya habia.
+            opciones = [(dias_de(d / ruta, consulta), k, d / ruta) for k, d in enumerate(datas) if (d / ruta).is_file()]
+            if not opciones:
+                print(f"  (sin {ruta}: no se publica)")
+                continue
+            dias, _, origen = max(opciones, key=lambda o: ((o[0][-1] if o[0] else ""), len(o[0]), o[1]))
+            listo = tmp / asset[:-3]
+            copia_consistente(origen, listo)
+            extra = ""
+            if asset in COMPACTAR:
+                a_, b_ = compactar_archivo(listo, COMPACTAR[asset])
+                extra = f"  compacto: {a_:,} -> {b_:,} filas"
+            elif asset == "historial.sqlite.gz":
+                n_at = agregar_atributos(listo, _bulk_de(datas))
+                extra = f"  tipo/color: {n_at:,}"
+            crudo, comp, sha = _gz(listo, salida / asset)
+            listos[asset] = listo
+            ent = {"asset": asset, "ruta": ruta, "dias": dias, "dia": dias[-1] if dias else None,
+                   "bytes": crudo, "gz_bytes": comp, "sha256": sha}
+            man["archivos"].append(ent)
+            v2.append({**ent, "version": tag, "conteos": conteos(listo), "maestra": asset == "historial.sqlite.gz"})
+            print(f"  {asset:32} {comp / 1e6:8.1f} MB  dias: {len(dias)} ({dias[-1] if dias else '-'}){extra}")
+            if asset == "historial.sqlite.gz":         # copia compacta para las computadoras que no corren scryfall.py
+                compacto = tmp / ASSET_HIST_COMPACTO[:-3]
+                shutil.copyfile(listo, compacto)
+                a_, b_ = compactar_archivo(compacto, SPEC_SCRYFALL, None)
+                crudo, comp, sha = _gz(compacto, salida / ASSET_HIST_COMPACTO)
+                listos[ASSET_HIST_COMPACTO] = compacto
+                v2.append({"asset": ASSET_HIST_COMPACTO, "ruta": ruta, "dias": dias, "dia": ent["dia"], "bytes": crudo,
+                           "gz_bytes": comp, "sha256": sha, "version": tag, "conteos": conteos(compacto)})
+                print(f"  {ASSET_HIST_COMPACTO:32} {comp / 1e6:8.1f} MB  compacto: {a_:,} -> {b_:,} filas")
+        ruta_emp, dia_emp = emparejado_mas_reciente([d / CARPETA_EMPAREJADO for d in datas])
+        if ruta_emp is not None:
+            crudo, comp, sha = comprimir(ruta_emp, salida / ASSET_EMPAREJADO)
+            ent = {"asset": ASSET_EMPAREJADO, "ruta": f"{CARPETA_EMPAREJADO}/{ruta_emp.name}", "dias": [dia_emp],
+                   "dia": dia_emp, "bytes": crudo, "gz_bytes": comp, "sha256": sha}
+            man["archivos"].append(ent)
+            v2.append({**ent, "version": tag})
+            print(f"  {ASSET_EMPAREJADO:32} {comp / 1e6:8.1f} MB  dia: {dia_emp}")
+        man["v2"] = {"archivos": v2, "parches": _parches(salida, tag, listos, v2, anterior, tmp)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     dias = [a["dia"] for a in man["archivos"] if a.get("dia")]
     man["dia"] = max(dias) if dias else None
     (salida / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Listo: {len(man['archivos'])} archivos en {salida} (tag {tag}).")
     return man
+
+
+def _parches(salida, tag, listos, v2, anterior, tmp):
+    """Parches de AYER a HOY de cada archivo (si se tiene el release de ayer en ANTERIOR) + los de dias anteriores que
+    siguen publicados, para que una computadora que lleva unos dias sin abrir Stack tambien baje solo lo que cambio."""
+    previos = []
+    viejo_man = {}
+    if anterior and (Path(anterior) / "manifest.json").is_file():
+        viejo_man = json.loads((Path(anterior) / "manifest.json").read_text(encoding="utf-8"))
+        previos = (viejo_man.get("v2") or {}).get("parches") or []
+    viejas = {a["asset"]: a for a in (viejo_man.get("v2") or {}).get("archivos") or []}
+    nuevos = []
+    for ent in v2:
+        asset = ent["asset"]
+        if asset not in listos or asset not in viejas or not (Path(anterior) / asset).is_file():
+            continue
+        desde = viejas[asset].get("version")
+        viejo = tmp / f"viejo_{asset[:-3]}"
+        parche = tmp / f"parche_{asset[:-3]}"
+        try:
+            _degz(Path(anterior) / asset, viejo)
+            res = hacer_parche(viejo, listos[asset], parche)
+        except (OSError, sqlite3.Error, EOFError) as e:
+            print(f"  (parche de {asset}: no se pudo: {e.__class__.__name__}: {e})")
+            res = None
+        finally:
+            viejo.unlink(missing_ok=True)
+        if res is None:
+            print(f"  (parche de {asset}: cambio la estructura; se baja completo)")
+            continue
+        nombre = f"parche_{asset}"
+        crudo, comp, sha = _gz(parche, salida / nombre)
+        parche.unlink(missing_ok=True)
+        if comp > PARCHE_MAX * ent["gz_bytes"]:
+            (salida / nombre).unlink()
+            print(f"  (parche de {asset}: {comp / 1e6:.1f} MB, casi como el archivo; se baja completo)")
+            continue
+        nuevos.append({"asset": asset, "desde": desde, "hasta": tag, "archivo": nombre, "gz_bytes": comp, "sha256": sha,
+                       "conteos": ent.get("conteos"), **res})
+        print(f"  {nombre:40} {comp / 1e6:8.2f} MB  (+{res['poner']:,} / -{res['quitar']:,} filas)")
+    lista = [p for p in previos if p.get("hasta") != tag] + nuevos
+    out = []
+    for asset in dict.fromkeys(p["asset"] for p in lista):
+        out += [p for p in lista if p["asset"] == asset][-PARCHES_POR_ARCHIVO:]
+    return out
 
 
 def _instalar(gz, a):
@@ -530,11 +877,16 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         return {(n, a): c for n, a, c in con.execute("SELECT n, acabado, centavos FROM precios WHERE dia = ?", (d,))}
 
     hoy, ayer, semana = precios_de(d_hoy), precios_de(d_1), precios_de(d_7)
+    try:
+        atributos = {n: (t, c) for n, t, c in con.execute("SELECT n, tipos, colores FROM atributos")}
+    except sqlite3.Error:
+        atributos = {}
     cartas = {}
     for n, sid, nombre, sc, sn, num, rar, lang, uri, img in con.execute(
             "SELECT n, id, name, set_code, set_name, collector_number, rarity, lang, scryfall_uri, imagen FROM cartas"):
         cartas[n] = {"sid": sid, "nombre": nombre, "set": sc, "set_nombre": sn, "num": num, "rareza": rar,
-                     "idioma": lang, "url_scryfall": (uri or "").split("?")[0] or None, "img": img}
+                     "idioma": lang, "url_scryfall": (uri or "").split("?")[0] or None, "img": img,
+                     "tipos": (atributos.get(n) or (None, None))[0], "colores": (atributos.get(n) or (None, None))[1]}
     # nombres en otros idiomas (MTGJSON): espanol primero (nombre_es de la ficha), luego frances, aleman, italiano y
     # portugues (letras latinas: los lee el escaner y la busqueda) y japones aparte (sin normalizar: el escaner lo lee
     # con su propio lector de texto y la busqueda lo compara tal cual)
@@ -572,7 +924,7 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         usd = cent / 100
         fila = {"sid": c["sid"], "nombre": c["nombre"], "set": c["set"], "set_nombre": c["set_nombre"], "num": c["num"],
                 "acab": LETRA_ACABADO[a], "idioma": c["idioma"], "rareza": c["rareza"], "img": c["img"],
-                "url_scryfall": c["url_scryfall"],
+                "url_scryfall": c["url_scryfall"], "tipos": c["tipos"], "colores": c["colores"],
                 "tcg": {"usd": usd, "d1": _pct(cent, ayer.get((n, a))), "d7": _pct(cent, semana.get((n, a))),
                         "estado": "ok", "dia": dia}}
         es = alias_es.get(c["nombre"])
@@ -602,15 +954,14 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         dia_har = h.execute("SELECT MAX(dia) FROM dias WHERE completo = 1").fetchone()[0]
         if dia_har:
             desde = (date.fromisoformat(dia_har) - timedelta(days=7)).isoformat()
-            vistos = set()
-            for d, sid, acab, idi, jpy, stock in h.execute(
-                    "SELECT dia, scryfall_id, acabado, idioma, jpy, stock FROM precios "
-                    "WHERE condicion = 'NM' AND idioma IN ('en', 'ja') AND dia >= ? ORDER BY dia DESC", (desde,)):
+            # el valor de cada dia (el historial puede venir compacto: solo cambios), el mas reciente de la ultima semana
+            series = leer_compacto(h, "precios", ["scryfall_id", "acabado", "idioma"], ["jpy", "stock"], "stock",
+                                   desde=desde, hasta=dia_har, donde="WHERE condicion = 'NM' AND idioma IN ('en', 'ja')")
+            for (sid, acab, idi), serie in series.items():
+                d, jpy, stock = serie[-1]
                 k = f"{sid}:{LETRA_ACABADO.get(acab, 'n')}"
-                clave = (k, idi)
-                if clave in vistos or k not in filas or not jpy:
+                if k not in filas or not jpy:
                     continue
-                vistos.add(clave)
                 campo = "har" if idi == "en" else "har_jp"
                 filas[k][campo] = {"jpy": jpy, "cond": "NM", "stock": stock,
                                    "estado": "ok" if d == dia_har else "previo", "dia": d}
@@ -680,7 +1031,8 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
             idx.append(len(imp))
             val = lambda campo, m: (f.get(campo) or {}).get(m) if (f.get(campo) or {}).get("estado") in ("ok", "previo") else None
             imp.append([k, f["set"], f["num"], f["acab"], f["idioma"], f["tcg"]["usd"], con_dato,
-                        val("har", "jpy"), val("scg", "usd"), val("ck", "usd")])   # fuente preferida en la pagina
+                        val("har", "jpy"), val("scg", "usd"), val("ck", "usd"),     # fuente preferida en la pagina
+                        f.get("tipos"), f.get("colores"), (f.get("rareza") or "")[:1]])  # filtros de la pagina
         textos = [normalizar(nombre)] + [normalizar(a) for a in alias_latinos.get(nombre, [])]
         textos = list(dict.fromkeys(t for t in textos if t))
         fila_n = [nombre, "|".join(textos), idx]
@@ -689,7 +1041,8 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         nombres.append(fila_n)
     b, sha = _json_compacto(carpeta / "buscar.json", {
         "esquema": ESQUEMA_WEB, "dia": dia, "nombres": nombres,
-        "imp_cols": ["k", "set", "num", "acab", "idioma", "tcg_usd", "fuentes", "har_jpy", "scg_usd", "ck_usd"], "imp": imp})
+        "imp_cols": ["k", "set", "num", "acab", "idioma", "tcg_usd", "fuentes", "har_jpy", "scg_usd", "ck_usd", "tipos", "colores",
+                     "rareza"], "imp": imp})
     archivos.append({"nombre": "buscar.json", "bytes": b, "sha256": sha})
 
     # p/xx.json: los 256 trozos, aunque alguno quede vacio
@@ -768,6 +1121,7 @@ def main(argv=None):
     p.add_argument("salida")
     p.add_argument("--tag", required=True)
     p.add_argument("--capa", action="append", default=[])
+    p.add_argument("--anterior", help="carpeta con el release anterior ya bajado (para armar los parches)")
     p = sub.add_parser("restaurar")
     p.add_argument("carpeta")
     p = sub.add_parser("web", help="archivos de la pagina web (manifest + buscar + precios + movers) en SALIDA")
@@ -794,7 +1148,7 @@ def main(argv=None):
         print("\nSube TODOS los archivos de esa carpeta a un release con el tag  datos-inicial  (ver el tutorial).")
         return 0
     if a.accion == "publicar":
-        man = publicar(a.salida, a.tag, a.capa or [str(RAIZ)])
+        man = publicar(a.salida, a.tag, a.capa or [str(RAIZ)], a.anterior)
         return 0 if man["archivos"] else 1
     restaurar(a.carpeta)
     return 0

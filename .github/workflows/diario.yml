@@ -37,7 +37,9 @@ jobs:
       - name: Traer los datos del ultimo release
         run: |
           mkdir -p anterior
-          gh release download --repo "$GITHUB_REPOSITORY" --dir anterior || echo "Todavia no hay releases: se empieza de cero."
+          gh release download --repo "$GITHUB_REPOSITORY" --dir anterior --pattern 'manifest.json' \
+            --pattern 'historial.sqlite.gz' --pattern 'hareruya_historial.sqlite.gz' --pattern 'scg.sqlite.gz' \
+            --pattern 'ck.sqlite.gz' --pattern 'hareruya_emparejado.sqlite.gz' || echo "Todavia no hay releases: se empieza de cero."
           python .github/nube.py restaurar anterior
       - name: Scryfall (Main1)
         run: python src/scryfall.py
@@ -199,6 +201,12 @@ jobs:
         with:
           name: scg
           path: capas/scg/data
+      - name: Traer el release de ayer (para publicar solo lo que cambio)
+        run: |
+          mkdir -p anterior
+          gh release download --repo "$GITHUB_REPOSITORY" --dir anterior --pattern '*.sqlite.gz' --pattern 'manifest.json' \
+            || echo "No hay release anterior: hoy no hay parches."
+          rm -f anterior/parche_*
       - name: Empaquetar
         run: |
           TAG="datos-$(date +%Y-%m-%d-%H%M)"
@@ -206,7 +214,7 @@ jobs:
           CAPAS="--capa capas/base"
           [ -d capas/hareruya ] && CAPAS="$CAPAS --capa capas/hareruya"
           [ -d capas/scg ] && CAPAS="$CAPAS --capa capas/scg"
-          python .github/nube.py publicar salida --tag "$TAG" $CAPAS
+          python .github/nube.py publicar salida --tag "$TAG" $CAPAS --anterior anterior
       - name: Crear el release del dia
         run: |
           NOTAS="Hareruya: ${{ needs.hareruya.result }} · SCG: ${{ needs.scg.result }}"
