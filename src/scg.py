@@ -639,8 +639,12 @@ def emparejar(q, filas):
 # ====================================================================================================
 # DESCARGA Y EMPAREJADO PARA STACK
 # ====================================================================================================
-RUTA_DB = CARPETA_SALIDA / "scg.sqlite"
-RUTA_PROGRESO = CARPETA_SALIDA / "progreso.json"
+# Modo UNIVERSO (S-0.8.0, una vez por semana): STACK_UNIVERSO=1 python src/scg.py
+#   busca TODOS los nombres de cartas de papel y empareja las versiones de MENOS de $2 (las de $2 o mas siguen en la descarga
+#   diaria). Mismas reglas de emparejado; todo va a un archivo aparte: scg_universo.sqlite.
+UNIVERSO = os.environ.get("STACK_UNIVERSO") == "1"
+RUTA_DB = CARPETA_SALIDA / ("scg_universo.sqlite" if UNIVERSO else "scg.sqlite")
+RUTA_PROGRESO = CARPETA_SALIDA / ("progreso_universo.json" if UNIVERSO else "progreso.json")
 RUTA_DETENER = CARPETA_SALIDA / "descargas" / "DETENER.txt"
 CAMPOS_GUARDADOS = ("name", "set", "set_code", "collector_number", "finish", "language", "condition", "price", "stock", "sku", "url", "doc")
 OTROS_GUARDADOS = 12                 # de los productos de OTRAS cartas solo se guardan unos cuantos (para 'nombres que si regreso')
@@ -697,8 +701,12 @@ def catalogo():
     try:
         # solo los nombres de la search_list: las fichas, emblemas y Art Series no se buscan (scryfall.py los deja fuera)
         pt = "promo_types" if any(r[1] == "promo_types" for r in con.execute("PRAGMA table_info(cards)")) else "NULL"
-        filas = con.execute(f"SELECT id, finish, name, set_code, collector_number, price_usd, set_name, lang, {pt} FROM cards "
-                            "WHERE name IN (SELECT name FROM search_list)").fetchall()
+        if UNIVERSO:                                  # las de menos de $2 de todos los nombres (las demas: descarga diaria)
+            filas = con.execute("SELECT u.id, u.finish, u.name, u.set_code, u.collector_number, u.price_usd, u.set_name, u.lang, u.promo_types "
+                                "FROM universo u WHERE u.en_catalogo = 0 AND u.name IN (SELECT name FROM search_list_universo)").fetchall()
+        else:
+            filas = con.execute(f"SELECT id, finish, name, set_code, collector_number, price_usd, set_name, lang, {pt} FROM cards "
+                                "WHERE name IN (SELECT name FROM search_list)").fetchall()
         try:
             dia = con.execute("SELECT MAX(fecha) FROM dias").fetchone()[0]
         except sqlite3.Error:
@@ -929,7 +937,8 @@ def descargar(n_actores=N_ACTORES):
         return 0
     # segunda busqueda (nombre + set) y reintento de errores
     filas, extra = filas_por_nombre(con)
-    kws = segunda_busqueda(versiones, filas, extra)
+    # en el universo no hay segunda busqueda: serian miles de 'nombre + set' de basicas y comunes de centavos
+    kws = [] if UNIVERSO else segunda_busqueda(versiones, filas, extra)
     if kws:
         print(f"Segunda busqueda para {len(kws):,} versiones (nombre + set, o reintento).")
         destino = dict(kws)

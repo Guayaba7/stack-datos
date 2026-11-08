@@ -57,7 +57,14 @@ CREATE TABLE IF NOT EXISTS precios (scryfall_id TEXT NOT NULL, acabado TEXT NOT 
 CREATE TABLE IF NOT EXISTS historial (dia TEXT NOT NULL, scryfall_id TEXT NOT NULL, acabado TEXT NOT NULL, venta REAL, stock INTEGER,
     compra REAL, quiere INTEGER, PRIMARY KEY (dia, scryfall_id, acabado));
 CREATE TABLE IF NOT EXISTS dias (dia TEXT PRIMARY KEY, archivo TEXT, productos INTEGER, versiones INTEGER, registrado_utc TEXT);
+CREATE TABLE IF NOT EXISTS precios_universo (scryfall_id TEXT NOT NULL, acabado TEXT NOT NULL, venta REAL, stock INTEGER, venta_nm REAL,
+    stock_nm INTEGER, compra REAL, quiere INTEGER, sku TEXT, url TEXT, variacion TEXT, edicion TEXT, PRIMARY KEY (scryfall_id, acabado));
+CREATE TABLE IF NOT EXISTS historial_universo (scryfall_id TEXT NOT NULL, acabado TEXT NOT NULL, dia TEXT NOT NULL, venta REAL,
+    compra REAL, PRIMARY KEY (scryfall_id, acabado, dia)) WITHOUT ROWID;
 """
+# Universo (S-0.8.0): las versiones de MENOS de $2 tambien (la lista de CK ya las trae todas: no cuesta otra descarga).
+# precios_universo = lo de hoy; historial_universo = condensado: solo cuando venta o compra se mueven de verdad.
+MOVIMIENTO_UNIVERSO = (0.10, 0.05)
 
 
 def ahora_utc():
@@ -149,32 +156,52 @@ def claves_catalogo():
         con.close()
 
 
+def claves_universo():
+    """Versiones del universo que NO estan en el catalogo de $2 o mas (vacio si el historial aun no trae el universo)."""
+    con = sqlite3.connect(f"{RUTA_HISTORIAL.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'universo'").fetchone():
+            return set()
+        return {f"{i}|{fin}" for i, fin in con.execute("SELECT id, finish FROM universo WHERE en_catalogo = 0")}
+    finally:
+        con.close()
+
+
+def _se_movio(antes, ahora):
+    pct, minimo = MOVIMIENTO_UNIVERSO
+    if antes is None or ahora is None:
+        return antes != ahora
+    return abs(ahora - antes) >= max(minimo, pct * antes)
+
+
 def emparejar(ruta):
     """Lee la lista guardada y llena precios + historial del dia de la descarga. -> resumen."""
     claves = claves_catalogo()
+    claves_u = claves_universo()
     with gzip.open(ruta, "rt", encoding="utf-8") as f:
         datos = json.load(f)                        # ~40-60 MB de JSON: se lee una vez y se suelta al terminar
     productos = datos.get("data") or []
     creado = (datos.get("meta") or {}).get("created_at")
     base = ((datos.get("meta") or {}).get("base_url") or "https://www.cardkingdom.com/").rstrip("/") + "/"
     del datos
-    filas, sin_id = {}, 0
+    filas, filas_u, sin_id = {}, {}, 0
     for p in productos:
         sid = p.get("scryfall_id")
         if not sid:
             sin_id += 1
             continue
         k = (sid, acabado_de(p))
-        if f"{k[0]}|{k[1]}" not in claves:
+        destino = filas if f"{k[0]}|{k[1]}" in claves else filas_u if f"{k[0]}|{k[1]}" in claves_u else None
+        if destino is None:
             continue
         cv = p.get("condition_values") or {}
         fila = (num(p.get("price_retail")), entero(p.get("qty_retail")), num(cv.get("nm_price")), entero(cv.get("nm_qty")),
                 num(p.get("price_buy")) or None, entero(p.get("qty_buying")), p.get("sku"),   # 0.00 = CK no la compra
                 (p.get("url") if str(p.get("url") or "").startswith("http") else base + str(p.get("url") or "").lstrip("/")) if p.get("url") else None,
                 p.get("variation"), p.get("edition"))
-        previa = filas.get(k)                        # dos productos para la misma version: se queda el que CK compra mas caro
+        previa = destino.get(k)                      # dos productos para la misma version: se queda el que CK compra mas caro
         if previa is None or (fila[4] or 0) > (previa[4] or 0):
-            filas[k] = fila
+            destino[k] = fila
     n_prod = len(productos)
     del productos
     m = re.search(r"(\d{4})(\d{2})(\d{2})_", Path(ruta).name)
@@ -188,6 +215,15 @@ def emparejar(ruta):
         con.execute("DELETE FROM historial WHERE dia = ?", (dia,))
         con.execute("INSERT INTO historial SELECT ?, scryfall_id, acabado, venta, stock, compra, quiere FROM precios", (dia,))
         con.execute("INSERT OR REPLACE INTO dias VALUES (?, ?, ?, ?, ?)", (dia, Path(ruta).name, n_prod, len(filas), ahora_utc()))
+        if filas_u:                                  # universo: lo de hoy + historial condensado
+            con.execute("DELETE FROM precios_universo")
+            con.executemany("INSERT INTO precios_universo VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [(*k, *v) for k, v in filas_u.items()])
+            ultimo = {(i, a): (v, c) for i, a, v, c in con.execute(
+                "SELECT h.scryfall_id, h.acabado, h.venta, h.compra FROM historial_universo h JOIN (SELECT scryfall_id, acabado, MAX(dia) d "
+                "FROM historial_universo GROUP BY scryfall_id, acabado) m ON m.scryfall_id = h.scryfall_id AND m.acabado = h.acabado AND m.d = h.dia")}
+            nuevos = [(*k, dia, v[0], v[4]) for k, v in filas_u.items()
+                      if k not in ultimo or _se_movio(ultimo[k][0], v[0]) or _se_movio(ultimo[k][1], v[4])]
+            con.executemany("INSERT OR REPLACE INTO historial_universo VALUES (?, ?, ?, ?, ?)", nuevos)
         inicio = datetime.fromtimestamp(Path(ruta).stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
         con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [(k, str(v)) for k, v in {
             "capturado_utc": inicio, "ck_creado": creado, "archivo": Path(ruta).name, "dia": dia, "productos": n_prod,
@@ -196,7 +232,8 @@ def emparejar(ruta):
     finally:
         con.close()
     con_compra = sum(1 for v in filas.values() if v[4])
-    print(f"Card Kingdom: {n_prod:,} productos en la lista · {len(filas):,} versiones del catalogo · {con_compra:,} con buylist · {sin_id:,} sin id de Scryfall")
+    print(f"Card Kingdom: {n_prod:,} productos en la lista · {len(filas):,} versiones del catalogo · {con_compra:,} con buylist · {sin_id:,} sin id de Scryfall"
+          + (f" · universo (< $2): {len(filas_u):,} versiones" if filas_u else ""))
     return {"productos": n_prod, "versiones": len(filas), "con_compra": con_compra, "dia": dia}
 
 

@@ -368,10 +368,11 @@ def cargar_referencia(con, nombre):
     cols = ["cards_rowid", "name", "set_code", "set_name", "collector_number", "finish", "price_usd",
             "rarity", "lang", "released_at", "id", "oracle_id", "scryfall_uri", "promo_types"]
     # promo_types del catalogo: sin el bulk de Scryfall es lo unico que dice si una impresion es prerelease / promo stamped
-    pt = "promo_types" if any(r[1] == "promo_types" for r in con.execute("PRAGMA table_info(cards)")) else "NULL"
+    tabla = "cards_universo" if UNIVERSO else "cards"   # universo: todas las impresiones cuentan como referencia
+    pt = "promo_types" if any(r[1] == "promo_types" for r in con.execute(f"PRAGMA table_info({tabla})")) else "NULL"
     filas = con.execute(
         "SELECT rowid, name, set_code, set_name, collector_number, finish, price_usd, rarity, lang, released_at, "
-        f"id, oracle_id, scryfall_uri, {pt} FROM cards WHERE name = ? COLLATE NOCASE "
+        f"id, oracle_id, scryfall_uri, {pt} FROM {tabla} WHERE name = ? COLLATE NOCASE "
         "ORDER BY released_at, set_code, collector_number, finish", (nombre,)).fetchall()
     refs = []
     for n, f in enumerate(filas, start=1):
@@ -1621,7 +1622,12 @@ VERSION_REGLAS = version_reglas(sys.modules[__name__])     # cambia si cambian l
 # ====================================================================================================
 # C. MOTOR SIN RED: universo de impresiones y emparejado de productos ya descargados
 # ====================================================================================================
-CARPETA_TIENDA = CARPETA_DATA / "tiendas" / "hareruya"   # todo lo de Hareruya
+# Modo UNIVERSO (S-0.8.0, una vez por semana): STACK_UNIVERSO=1 python src/hareruya.py ...
+#   busca TODOS los nombres de cartas de papel (search_list_universo) y empareja contra TODAS sus impresiones (cards_universo):
+#   asi las versiones de menos de $2 tambien quedan confirmadas. Mismas reglas de emparejado; todo va a una carpeta aparte
+#   (data/tiendas/hareruya/universo/) y la descarga diaria de $2 o mas no cambia.
+UNIVERSO = os.environ.get("STACK_UNIVERSO") == "1"
+CARPETA_TIENDA = CARPETA_DATA / "tiendas" / "hareruya" / ("universo" if UNIVERSO else "")   # todo lo de Hareruya
 CARPETA_SECO = CARPETA_TIENDA / "descargas"             # precios tal como los publica Hareruya (lo que baja el scraper)
 CARPETA_CACHE = CARPETA_TIENDA / "emparejado"           # emparejados e indice del bulk (se pueden borrar: se rehacen)
 RUTA_PROGRESO = CARPETA_TIENDA / "progreso.json"        # avance de la descarga (lo muestra Stack)
@@ -1656,7 +1662,8 @@ def leer_search_list(ruta_catalogo=None):
     """[{name, buscar_como}] de la search_list del historial (solo lectura), sin repetidos."""
     con = abrir_catalogo(Path(ruta_catalogo or RUTA_HISTORIAL))
     try:
-        filas = con.execute("SELECT name, buscar_como FROM search_list ORDER BY name").fetchall()
+        tabla = "search_list_universo" if UNIVERSO else "search_list"
+        filas = con.execute(f"SELECT name, buscar_como FROM {tabla} ORDER BY name").fetchall()
     finally:
         con.close()
     vistos, cartas = set(), []
@@ -2048,6 +2055,36 @@ CREATE TABLE IF NOT EXISTS precios (dia TEXT NOT NULL, scryfall_id TEXT NOT NULL
     PRIMARY KEY (scryfall_id, acabado, idioma, condicion, dia)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_hh_dia ON precios(dia);
 """
+# Universo: lo que hay que revisar (ambiguas y sin coincidencia de verdad) de la ultima semana, para la lista "< $2" de las
+# herramientas de Stack. Va dentro del historial del universo porque el emparejado completo es muy grande para publicarlo.
+DDL_AMBIGUAS = """
+CREATE TABLE IF NOT EXISTS ambiguas (n INTEGER PRIMARY KEY, dia TEXT, nombre_buscado TEXT, producto TEXT, set_original TEXT,
+    idioma TEXT, condicion TEXT, precio_jpy INTEGER, stock INTEGER, estado TEXT, motivo TEXT, scryfall_id TEXT, acabado TEXT,
+    set_scryfall TEXT, numero_scryfall TEXT, precio_scryfall_usd REAL);
+"""
+SIN_REVISION = ("confirmado", "no_es_carta", "irrelevante", "descartado")
+
+
+def _guardar_ambiguas(src, con, dia):
+    """Del emparejado del universo: ambiguas / sin coincidencia de versiones de MENOS de $2 (las de $2 o mas se revisan en la
+    lista de siempre). Sin basura (fundas, oversized...) ni productos de otra carta."""
+    cp = {r[1] for r in src.execute("PRAGMA table_info(hareruya_productos)")}
+    cd = {r[1] for r in src.execute("PRAGMA table_info(decisiones)")}
+    col = lambda t, c, cols: f"{t}.{c}" if c in cols else "NULL"
+    filas = src.execute(
+        f"SELECT {col('d', 'nombre_buscado', cd)}, {col('p', 'product_name_en_original', cp)}, {col('p', 'set_original', cp)}, "
+        f"{col('p', 'idioma', cp)}, {col('p', 'condicion', cp)}, {col('p', 'precio_jpy', cp)}, {col('p', 'stock', cp)}, d.estado, "
+        f"{col('d', 'motivo', cd)}, d.scryfall_id, d.acabado_scryfall, {col('d', 'set_scryfall', cd)}, {col('d', 'numero_scryfall', cd)}, "
+        f"{col('d', 'precio_scryfall_usd', cd)} FROM decisiones d JOIN hareruya_productos p ON p.source_id = d.source_id "
+        f"WHERE d.estado NOT IN ({','.join('?' * len(SIN_REVISION))})", SIN_REVISION).fetchall()
+    salida = [f for f in filas if not es_basura({"product_name_en": f[1] or ""})
+              and (f[13] is None or float(f[13]) < 2)]
+    con.executescript(DDL_AMBIGUAS)
+    con.execute("DELETE FROM ambiguas")
+    con.executemany("INSERT INTO ambiguas (dia, nombre_buscado, producto, set_original, idioma, condicion, precio_jpy, stock, estado, "
+                    "motivo, scryfall_id, acabado, set_scryfall, numero_scryfall, precio_scryfall_usd) "
+                    "VALUES (" + ",".join("?" * 15) + ")", [(dia, *f) for f in salida])
+    return len(salida)
 
 
 def registrar_historial(ruta_emparejado):
@@ -2068,6 +2105,15 @@ def registrar_historial(ruta_emparejado):
             "      FROM decisiones d JOIN hareruya_productos p ON p.source_id = d.source_id "
             "      WHERE d.estado = 'confirmado' AND d.scryfall_id IS NOT NULL AND p.precio_jpy IS NOT NULL) "
             "GROUP BY scryfall_id, acabado, idioma, condicion").fetchall()
+        if UNIVERSO:
+            RUTA_HIST_HAR.parent.mkdir(parents=True, exist_ok=True)
+            amb_con = sqlite3.connect(RUTA_HIST_HAR, timeout=30)
+            try:
+                n_amb = _guardar_ambiguas(src, amb_con, dia)
+                amb_con.commit()
+            finally:
+                amb_con.close()
+            print(f"Universo: {n_amb:,} productos de menos de $2 para revisar (ambiguas / sin coincidencia)", flush=True)
     finally:
         src.close()
     RUTA_HIST_HAR.parent.mkdir(parents=True, exist_ok=True)
@@ -2464,8 +2510,48 @@ def _historial_para_subir():
     return copia.with_name(ASSET_HIST_PC)
 
 
-def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
-    """Descarga Hareruya (retoma si quedo a medias) y sube el resultado a la nube para que el workflow lo use."""
+CARPETA_SECO_UNIVERSO = CARPETA_DATA / "tiendas" / "hareruya" / "universo" / "descargas"
+DIAS_UNIVERSO = 7                 # el universo (todas las cartas) se descarga una vez por semana
+PREFIJO_UNIVERSO = "universo_"    # en el release hareruya-pc, para no chocar con la descarga diaria
+
+
+def _ultimo_universo():
+    """La descarga del universo mas reciente que quedo completa (o None)."""
+    if not CARPETA_SECO_UNIVERSO.is_dir():
+        return None
+    for ruta in sorted(CARPETA_SECO_UNIVERSO.glob(PATRON_SECO), reverse=True):
+        try:
+            if meta_seco(ruta).get("completo"):
+                return ruta
+        except Exception:                            # noqa: BLE001
+            continue
+    return None
+
+
+def universo_toca(forzar=False):
+    if forzar:
+        return True
+    ult = _ultimo_universo()
+    if ult is None:
+        return True
+    dia = dia_de_seco(ult)
+    try:
+        return (datetime.now().date() - datetime.fromisoformat(dia).date()).days >= DIAS_UNIVERSO
+    except ValueError:
+        return True
+
+
+def descargar_universo():
+    """Corre la descarga del universo en otro proceso (STACK_UNIVERSO=1) y regresa su archivo si quedo completo."""
+    import subprocess
+    print("Universo de Hareruya (todas las cartas, una vez por semana): esto tarda mas que la descarga diaria ...", flush=True)
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), "descargar"], env={**os.environ, "STACK_UNIVERSO": "1"})
+    return _ultimo_universo()
+
+
+def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC, universo=False):
+    """Descarga Hareruya (retoma si quedo a medias) y sube el resultado a la nube para que el workflow lo use.
+    Una vez por semana (o con --universo) tambien descarga el UNIVERSO (todas las cartas) y lo sube aparte."""
     import subprocess
     gh = shutil.which("gh")
     if not gh:
@@ -2487,6 +2573,16 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
     archivos = [ruta, ruta.with_name(ruta.name.replace(".jsonl.gz", ".meta.json"))] if ruta else []
     if RUTA_HIST_HAR.is_file():                     # tu historial siempre: la nube agrega los dias que le falten
         archivos.append(_historial_para_subir())
+    if ok and ruta is not None and universo_toca(universo):
+        u = descargar_universo()
+        if u is not None and dia_de_seco(u) == datetime.now().date().isoformat():
+            import tempfile
+            for origen in (u, u.with_name(u.name.replace(".jsonl.gz", ".meta.json"))):
+                copia = Path(tempfile.gettempdir()) / (PREFIJO_UNIVERSO + origen.name)
+                shutil.copyfile(origen, copia)
+                archivos.append(copia)
+        else:
+            print("El universo no quedo completo: se retoma la proxima vez.", flush=True)
     if not archivos:
         sys.exit("No hay nada que subir.")
     if corre("release", "view", tag, "--repo", repo).returncode != 0:   # pre-release: nunca es el 'latest' de los datos
@@ -2494,7 +2590,10 @@ def subir_a_nube(repo=REPO_NUBE, tag=TAG_PC):
                   "--notes", "Descarga de Hareruya hecha en la PC (Hareruya bloquea a GitHub). La usa el workflow diario.")
         if c.returncode != 0:
             sys.exit("No se pudo crear el release: " + c.stderr.strip())
+    sube_universo = any(x.name.startswith(PREFIJO_UNIVERSO) for x in archivos)
     for a in json.loads(corre("release", "view", tag, "--repo", repo, "--json", "assets").stdout or "{}").get("assets", []):
+        if a["name"].startswith(PREFIJO_UNIVERSO) and not sube_universo:
+            continue                                               # el universo de la semana se queda hasta que haya otro
         if a["name"] not in {x.name for x in archivos}:            # solo queda la de hoy
             corre("release", "delete-asset", tag, a["name"], "--repo", repo, "--yes")
     u = corre("release", "upload", tag, *map(str, archivos), "--repo", repo, "--clobber")
@@ -2519,6 +2618,7 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=N_WORKERS, help=f"procesos en paralelo (por defecto {N_WORKERS})")
     ap.add_argument("--nueva", action="store_true", help="empezar una descarga nueva aunque haya una a medias")
     ap.add_argument("--todo", action="store_true", help="historial: emparejar tambien las descargas que no tengan emparejado")
+    ap.add_argument("--universo", action="store_true", help="nube: descargar tambien el universo (todas las cartas) aunque no toque")
     a = ap.parse_args(argv)
     if a.accion == "detener":
         CARPETA_SECO.mkdir(parents=True, exist_ok=True)
@@ -2531,7 +2631,7 @@ def main(argv=None):
     elif a.accion == "juntar":                      # juntar ARCHIVO: agrega al historial los dias de otro historial
         juntar_historial(a.archivo)
     elif a.accion == "nube":                        # en tu PC: descargar y subir a la nube (ver subir_a_nube)
-        subir_a_nube()
+        subir_a_nube(universo=a.universo)
     elif a.accion == "emparejar":
         ruta = emparejar()
         print(f"Emparejado -> {ruta}")
