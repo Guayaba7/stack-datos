@@ -44,6 +44,9 @@ ARCHIVOS = {
     "hareruya_historial.sqlite.gz": ("tiendas/hareruya/historial_hareruya.sqlite", "SELECT dia FROM dias"),
     "scg.sqlite.gz": ("tiendas/starcitygames/scg.sqlite", "SELECT dia FROM dias"),
     "ck.sqlite.gz": ("tiendas/cardkingdom/ck.sqlite", "SELECT dia FROM dias"),
+    # universo (S-0.8.0): las de menos de $2 en SCG y Hareruya, una vez por semana
+    "scg_universo.sqlite.gz": ("tiendas/starcitygames/scg_universo.sqlite", "SELECT dia FROM dias"),
+    "hareruya_universo.sqlite.gz": ("tiendas/hareruya/universo/historial_hareruya.sqlite", "SELECT dia FROM dias"),
 }
 ASSET_EMPAREJADO = "hareruya_emparejado.sqlite.gz"     # el emparejado mas reciente (precios de Hareruya de hoy)
 CARPETA_EMPAREJADO = "tiendas/hareruya/emparejado"
@@ -156,6 +159,8 @@ COMPACTAR = {        # asset -> como compactarlo
                                      "tumba": {"jpy": 0, "stock": -1, "ofertas": 0}, "marca": "stock",
                                      "quitar_indices": ["idx_hh_dia"], "completos": 0},
 }
+COMPACTAR["scg_universo.sqlite.gz"] = {**COMPACTAR["scg.sqlite.gz"], "quitar_tablas": ["busquedas"]}  # lo crudo de SCG no se publica
+COMPACTAR["hareruya_universo.sqlite.gz"] = COMPACTAR["hareruya_historial.sqlite.gz"]
 # El historial de Scryfall NO se compacta en la nube (scryfall.py y mtgjson.py corrigen dias anteriores): se publica completo
 # (para el workflow y para la PC principal) y ADEMAS una copia compacta para las demas computadoras.
 ASSET_HIST_COMPACTO = "historial_compacto.sqlite.gz"
@@ -241,6 +246,8 @@ def compactar(con, spec, stock_dias=STOCK_DIAS):
         con.execute(f"DELETE FROM {t}")
     for ix in spec.get("quitar_indices", []):
         con.execute(f"DROP INDEX IF EXISTS {ix}")
+    for tb in spec.get("quitar_tablas", []):
+        con.execute(f"DROP TABLE IF EXISTS {tb}")
     con.executemany(f"INSERT INTO {t} ({', '.join(orden)}) VALUES ({', '.join('?' * len(orden))})", filas)
     con.execute(f"CREATE TABLE IF NOT EXISTS {TABLA_COMPACTO} (dia PRIMARY KEY)")
     con.execute(f"DELETE FROM {TABLA_COMPACTO}")
@@ -379,6 +386,144 @@ def agregar_atributos(ruta_hist, bulk):
         con.executemany("INSERT OR REPLACE INTO atributos VALUES (?, ?, ?)", filas)
         con.commit()
         return len(filas)
+    finally:
+        con.close()
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# UNIVERSO (S-0.8.0): todas las cartas de papel, no solo las de $2 o mas.
+#   universo         una fila por impresion + acabado (~160k): datos, precio TCG de hoy (puede ser NULL), si esta en el
+#                    catalogo de $2 o mas, tipo y color. Lo leen las tiendas en modo universo (STACK_UNIVERSO=1), la app,
+#                    la pagina y el escaner.
+#   cards_universo   vista con las MISMAS columnas que `cards` (asi scg.py y hareruya.py solo cambian el nombre de la tabla)
+#   search_list_universo   los nombres a buscar en las tiendas (mismo criterio que la search_list de scryfall.py)
+#   universo_hist    historial CONDENSADO de las de menos de $2: solo se guarda un precio nuevo cuando se mueve de verdad
+#                    (10% o mas y al menos 5 centavos). Las de $2 o mas tienen su historial diario de siempre.
+# Corre en el workflow justo despues de scryfall.py, con el mismo default-cards del dia. scryfall.py no cambia.
+# ------------------------------------------------------------------------------------------------------------------
+LAYOUTS_NO_SE_BUSCAN = {"token", "double_faced_token", "emblem", "art_series"}
+CAMPOS_USD = {"usd": "nonfoil", "usd_foil": "foil", "usd_etched": "etched"}
+ACABADO_NUM_U = {"nonfoil": 0, "foil": 1, "etched": 2}
+UNIVERSO_MOVIMIENTO = (0.10, 5)      # un precio nuevo entra al historial condensado si cambia >= 10% y >= 5 centavos
+
+DDL_UNIVERSO = """
+CREATE TABLE IF NOT EXISTS universo (
+    u INTEGER PRIMARY KEY, id TEXT NOT NULL, finish TEXT NOT NULL, name TEXT NOT NULL, set_code TEXT,
+    set_name TEXT, collector_number TEXT, rarity TEXT, lang TEXT, released_at TEXT, promo_types TEXT,
+    layout TEXT, price_usd REAL, en_catalogo INTEGER NOT NULL DEFAULT 0, tipos INTEGER, colores TEXT,
+    UNIQUE (id, finish));       -- imagen: https://cards.scryfall.io/normal/front/<id[0]>/<id[1]>/<id>.jpg
+CREATE INDEX IF NOT EXISTS idx_universo_nombre ON universo(name COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS search_list_universo (
+    name TEXT PRIMARY KEY, buscar_como TEXT NOT NULL, impresiones INTEGER, versiones INTEGER,
+    precio_min_usd REAL, precio_max_usd REAL, tiene_normal INTEGER, tiene_foil_o_etched INTEGER);
+CREATE TABLE IF NOT EXISTS universo_hist (
+    id TEXT NOT NULL, acabado INTEGER NOT NULL, dia INTEGER NOT NULL, centavos INTEGER NOT NULL,
+    PRIMARY KEY (id, acabado, dia)) WITHOUT ROWID;
+DROP VIEW IF EXISTS cards_universo;
+CREATE VIEW cards_universo AS
+    SELECT u AS rowid, name, set_code, set_name, collector_number, finish, price_usd, rarity, lang, released_at, id,
+           NULL AS oracle_id, NULL AS scryfall_uri, NULL AS tratamiento, promo_types
+    FROM universo WHERE layout IS NULL OR layout NOT IN ('token', 'double_faced_token', 'emblem', 'art_series');
+"""
+
+
+def _tipo_color(c):
+    caras = c.get("card_faces") or []
+    tipo = c.get("type_line") or " // ".join(x.get("type_line") or "" for x in caras)
+    bits = sum(b for palabra, b in TIPOS_BITS if re.search(rf"\b{palabra}\b", tipo))
+    col = set(c.get("colors") or [])
+    for x in caras:
+        col |= set(x.get("colors") or [])
+    if not col and bits & 1:
+        col = set(c.get("produced_mana") or []) & set("WUBRG")
+    return bits, "".join(x for x in "WUBRG" if x in col)
+
+
+def _precio(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f >= 0 else None
+
+
+def armar_universo(ruta_hist, bulk):
+    """Llena universo, search_list_universo y universo_hist en el historial. -> resumen."""
+    if not bulk or not Path(bulk).is_file():
+        raise RuntimeError("no hay default-cards de Scryfall (corre scryfall.py antes)")
+    con = sqlite3.connect(ruta_hist)
+    try:
+        con.executescript(DDL_UNIVERSO)
+        dia = con.execute("SELECT MAX(dia) FROM dias").fetchone()[0]
+        en_cat = {(i, f) for i, f in con.execute("SELECT id, finish FROM cards")}
+        filas = []
+        with gzip.open(bulk, "rt", encoding="utf-8") as f:
+            for linea in f:
+                linea = linea.strip().rstrip(",")
+                if not linea.startswith("{"):
+                    continue
+                try:
+                    c = json.loads(linea)
+                except ValueError:
+                    continue
+                if c.get("digital") or "paper" not in (c.get("games") or []) or not c.get("id"):
+                    continue
+                precios = c.get("prices") or {}
+                tipos, colores = _tipo_color(c)
+                for campo, fin in CAMPOS_USD.items():
+                    if fin not in (c.get("finishes") or []):
+                        continue
+                    filas.append((c["id"], fin, (c.get("name") or "").strip(), c.get("set"), c.get("set_name"),
+                                  c.get("collector_number"), c.get("rarity"), c.get("lang"), c.get("released_at"),
+                                  ", ".join(c.get("promo_types") or []) or None, c.get("layout"),
+                                  _precio(precios.get(campo)), int((c["id"], fin) in en_cat), tipos, colores))
+        if len(filas) < 100_000:
+            raise RuntimeError(f"el default-cards trae muy pocas cartas ({len(filas):,}): no se toca el universo")
+        con.execute("BEGIN")
+        con.execute("DELETE FROM universo")
+        con.executemany("INSERT INTO universo (id, finish, name, set_code, set_name, collector_number, rarity, lang, released_at, "
+                        "promo_types, layout, price_usd, en_catalogo, tipos, colores) "
+                        "VALUES (" + ",".join("?" * 15) + ")", filas)
+        # nombres a buscar (como scryfall.py: un renglon por nombre; fichas, emblemas y Art Series no se buscan)
+        grupos = {}
+        for r in filas:
+            k = r[2].casefold()
+            g = grupos.setdefault(k, {"name": r[2], "ids": set(), "v": 0, "min": None, "max": None, "n": False, "f": False, "tok": True})
+            g["ids"].add(r[0])
+            g["v"] += 1
+            if r[11] is not None:
+                g["min"] = r[11] if g["min"] is None else min(g["min"], r[11])
+                g["max"] = r[11] if g["max"] is None else max(g["max"], r[11])
+            g["n"] |= r[1] == "nonfoil"
+            g["f"] |= r[1] in ("foil", "etched")
+            g["tok"] = g["tok"] and r[10] in LAYOUTS_NO_SE_BUSCAN
+        con.execute("DELETE FROM search_list_universo")
+        con.executemany("INSERT INTO search_list_universo VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        [(g["name"], g["name"].split(" // ")[0].strip(), len(g["ids"]), g["v"], g["min"], g["max"], int(g["n"]), int(g["f"]))
+                         for g in grupos.values() if not g["tok"] and g["name"]])
+        # historial condensado de las de menos de $2
+        ultimo = {}
+        for i, a, cts in con.execute("SELECT h.id, h.acabado, h.centavos FROM universo_hist h JOIN "
+                                     "(SELECT id, acabado, MAX(dia) d FROM universo_hist GROUP BY id, acabado) m "
+                                     "ON m.id = h.id AND m.acabado = h.acabado AND m.d = h.dia"):
+            ultimo[(i, a)] = cts
+        pct, minimo = UNIVERSO_MOVIMIENTO
+        nuevos = []
+        for r in filas:
+            if r[12] or r[11] is None:
+                continue
+            k, cts = (r[0], ACABADO_NUM_U[r[1]]), int(round(r[11] * 100))
+            antes = ultimo.get(k)
+            if antes is None or abs(cts - antes) >= max(minimo, pct * antes):
+                nuevos.append((*k, dia, cts))
+        con.executemany("INSERT OR REPLACE INTO universo_hist VALUES (?, ?, ?, ?)", nuevos)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('universo_dia', ?)", (str(dia),))
+        con.execute("COMMIT")
+        n_cat = sum(r[12] for r in filas)
+        res = {"versiones": len(filas), "en_catalogo": n_cat, "nombres": len(grupos), "hist_nuevos": len(nuevos)}
+        print(f"Universo: {len(filas):,} versiones ({n_cat:,} en el catalogo de $2 o mas) · {len(grupos):,} nombres · "
+              f"{len(nuevos):,} precios nuevos en el historial condensado")
+        return res
     finally:
         con.close()
 
@@ -736,6 +881,8 @@ def _bajar_release(cache):
         "har": rutas.get("hareruya_historial.sqlite"),
         "scg": rutas.get("scg.sqlite"),
         "ck": rutas.get("ck.sqlite"),
+        "scg_u": rutas.get("scg_universo.sqlite"),
+        "har_u": rutas.get("hareruya_universo.sqlite"),
     }
 
 
@@ -746,7 +893,89 @@ def _rutas_locales():
         "har": d / "tiendas/hareruya/historial_hareruya.sqlite",
         "scg": d / "tiendas/starcitygames/scg.sqlite",
         "ck": d / "tiendas/cardkingdom/ck.sqlite",
+        "scg_u": d / "tiendas/starcitygames/scg_universo.sqlite",
+        "har_u": d / "tiendas/hareruya/universo/historial_hareruya.sqlite",
     }
+
+
+LETRAS_FUENTE = (("har", "H"), ("har_jp", "J"), ("scg", "S"), ("ck", "C"))
+
+
+def _imp_web(f, k):
+    """Renglon de una impresion en buscar.json / u/xx.json:
+    [k, set, num, acab, idioma, tcg_usd, fuentes, har_jpy, scg_usd, ck_usd, tipos, colores, rareza]"""
+    ok = lambda campo: (f.get(campo) or {}).get("estado") in ("ok", "previo")
+    val = lambda campo, m: (f.get(campo) or {}).get(m) if ok(campo) else None
+    return [k, f["set"], f["num"], f["acab"], f["idioma"], f["tcg"]["usd"], "".join(l for c, l in LETRAS_FUENTE if ok(c)),
+            val("har", "jpy"), val("scg", "usd"), val("ck", "usd"), f.get("tipos"), f.get("colores"), (f.get("rareza") or "")[:1]]
+
+
+def _trozo_nombre(nombre):
+    return int(hashlib.md5(nombre.encode("utf-8")).hexdigest()[:2], 16)
+
+
+def _web_universo(rutas, dia, alias_es):
+    """{k: fila} de las impresiones de MENOS de $2 (vacio si el historial aun no trae el universo)."""
+    filas = {}
+    con = abrir_ro(rutas["historial"])
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'universo'").fetchone():
+            return filas
+        for sid, fin, nombre, sc, sn, num, rar, lang, usd, tipos, colores in con.execute(
+                "SELECT id, finish, name, set_code, set_name, collector_number, rarity, lang, price_usd, tipos, colores "
+                "FROM universo WHERE en_catalogo = 0"):
+            k = f"{sid}:{LETRA_ACABADO[fin]}"
+            filas[k] = {"sid": sid, "nombre": nombre, "set": sc, "set_nombre": sn, "num": num, "acab": LETRA_ACABADO[fin],
+                        "idioma": lang, "rareza": rar, "tipos": tipos, "colores": colores, "u": 1,   # img y url: la pagina las arma
+                        "tcg": {"usd": usd, "d1": None, "d7": None, "estado": "ok" if usd is not None else "sin", "dia": dia}}
+            if alias_es.get(nombre):
+                filas[k]["nombre_es"] = alias_es[nombre][0]
+    finally:
+        con.close()
+    n = {"ck": 0, "scg": 0, "har": 0}
+    if rutas.get("ck") and rutas["ck"].is_file():
+        c = abrir_ro(rutas["ck"])
+        try:
+            dia_ck = dict(c.execute("SELECT key, value FROM meta")).get("dia")
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name = 'precios_universo'").fetchone():
+                for sid, acab, venta, stock, venta_nm, stock_nm, compra, quiere, url in c.execute(
+                        "SELECT scryfall_id, acabado, venta, stock, venta_nm, stock_nm, compra, quiere, url FROM precios_universo"):
+                    f = filas.get(f"{sid}:{LETRA_ACABADO.get(acab, 'n')}")
+                    if f:
+                        f["ck"] = {"usd": venta_nm or venta, "stock": stock_nm if venta_nm else stock,
+                                   "compra_usd": compra if compra and compra > 0 else None, "quiere": quiere if compra and compra > 0 else None,
+                                   "url": url or None, "estado": "ok", "dia": dia_ck}
+                        n["ck"] += 1
+        finally:
+            c.close()
+    if rutas.get("scg_u") and rutas["scg_u"].is_file():
+        c = abrir_ro(rutas["scg_u"])
+        try:
+            dia_s = dict(c.execute("SELECT key, value FROM meta")).get("dia")
+            for sid, acab, est, usd, stock, cond, url in c.execute(
+                    "SELECT scryfall_id, acabado, estado, precio_usd, stock, condicion, url FROM precios"):
+                f = filas.get(f"{sid}:{LETRA_ACABADO.get(acab, 'n')}")
+                if f and est in ("exacto", "probable") and usd:
+                    f["scg"] = {"usd": usd, "cond": "NM" if cond == "Near Mint" else (cond or None), "stock": stock,
+                                "url": url or None, "estado": "ok", "dia": dia_s}
+                    n["scg"] += 1
+        finally:
+            c.close()
+    if rutas.get("har_u") and rutas["har_u"].is_file():
+        c = abrir_ro(rutas["har_u"])
+        try:
+            series = leer_compacto(c, "precios", ["scryfall_id", "acabado", "idioma"], ["jpy", "stock"], "stock",
+                                   donde="WHERE condicion = 'NM' AND idioma IN ('en', 'ja')")
+            for (sid, acab, idi), serie in series.items():
+                d, jpy, stock = serie[-1]
+                f = filas.get(f"{sid}:{LETRA_ACABADO.get(acab, 'n')}")
+                if f and jpy:
+                    f["har" if idi == "en" else "har_jp"] = {"jpy": jpy, "cond": "NM", "stock": stock, "estado": "ok", "dia": d}
+                    n["har"] += 1
+        finally:
+            c.close()
+    print(f"  Universo (< $2): {len(filas):,} impresiones · CK {n['ck']:,} · SCG {n['scg']:,} · Hareruya {n['har']:,}")
+    return filas
 
 
 def _pct(hoy, antes):
@@ -1011,6 +1240,9 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
     estado_fuente("ck", dia_ck, n_ck)
     print(f"  Card Kingdom: {n_ck:,} ({dia_ck or 'sin datos'})")
 
+    # --- 4b) Universo: las impresiones de MENOS de $2 (S-0.8.0). Precio TCG diario; CK diario; SCG y Hareruya semanal --
+    filas_u = _web_universo(rutas, dia, alias_es)
+
     # --- 5) Escribir los archivos del dia -------------------------------------------------------------------------
     carpeta = salida / dia
     if carpeta.exists():
@@ -1030,15 +1262,40 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
             con_dato = "".join(l for campo, l in letras if (f.get(campo) or {}).get("estado") in ("ok", "previo"))
             idx.append(len(imp))
             val = lambda campo, m: (f.get(campo) or {}).get(m) if (f.get(campo) or {}).get("estado") in ("ok", "previo") else None
-            imp.append([k, f["set"], f["num"], f["acab"], f["idioma"], f["tcg"]["usd"], con_dato,
-                        val("har", "jpy"), val("scg", "usd"), val("ck", "usd"),     # fuente preferida en la pagina
-                        f.get("tipos"), f.get("colores"), (f.get("rareza") or "")[:1]])  # filtros de la pagina
+            imp.append(_imp_web(f, k))
         textos = [normalizar(nombre)] + [normalizar(a) for a in alias_latinos.get(nombre, [])]
         textos = list(dict.fromkeys(t for t in textos if t))
         fila_n = [nombre, "|".join(textos), idx]
         if alias_ja.get(nombre):
             fila_n.append("|".join(dict.fromkeys(alias_ja[nombre])))      # 4a columna: nombres en japones
         nombres.append(fila_n)
+    # universo: los nombres que solo tienen versiones de menos de $2 tambien se pueden buscar; sus impresiones (y las de
+    # menos de $2 de los demas nombres) estan en u/xx.json, que la pagina baja cuando hace falta. 5a columna = ese trozo.
+    grupos_u = {}
+    for k, f in filas_u.items():
+        grupos_u.setdefault(f["nombre"], []).append(k)
+    por_nombre = {n[0]: n for n in nombres}
+    for nombre in grupos_u:
+        if nombre not in por_nombre:
+            textos = [normalizar(nombre)] + [normalizar(a) for a in alias_latinos.get(nombre, [])]
+            fila_n = [nombre, "|".join(dict.fromkeys(t for t in textos if t)), []]
+            if alias_ja.get(nombre):
+                fila_n.append("|".join(dict.fromkeys(alias_ja[nombre])))
+            nombres.append(fila_n)
+            por_nombre[nombre] = fila_n
+        fila_n = por_nombre[nombre]
+        while len(fila_n) < 4:
+            fila_n.append("")
+        fila_n.append(_trozo_nombre(nombre))
+    nombres.sort(key=lambda n: n[0])
+    trozos_u = {f"{i:02x}": {} for i in range(256)}
+    for nombre, ks in grupos_u.items():
+        trozos_u[f"{_trozo_nombre(nombre):02x}"][nombre] = [_imp_web(filas_u[k], k) for k in
+                                                           sorted(ks, key=lambda x: -(filas_u[x]["tcg"]["usd"] or 0))]
+    total_u = 0
+    for xx, contenido in trozos_u.items():
+        b_, _ = _json_compacto(carpeta / "u" / f"{xx}.json", {"esquema": ESQUEMA_WEB, "dia": dia, "nombres": contenido})
+        total_u += b_
     b, sha = _json_compacto(carpeta / "buscar.json", {
         "esquema": ESQUEMA_WEB, "dia": dia, "nombres": nombres,
         "imp_cols": ["k", "set", "num", "acab", "idioma", "tcg_usd", "fuentes", "har_jpy", "scg_usd", "ck_usd", "tipos", "colores",
@@ -1047,7 +1304,7 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
 
     # p/xx.json: los 256 trozos, aunque alguno quede vacio
     trozos = {f"{i:02x}": {} for i in range(256)}
-    for k, f in filas.items():
+    for k, f in list(filas.items()) + list(filas_u.items()):      # el universo tambien: ficha e inventarios
         trozos.setdefault(f["sid"][:2].lower(), {})[k] = f
     total_p = 0
     for xx, contenido in trozos.items():
@@ -1103,12 +1360,13 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         "esquema": ESQUEMA_WEB, "dia": dia, "generado_utc": ahora_utc(), "ruta": f"{dia}/", "ultimo_bueno": dia,
         "dias": guardados[:DIAS_WEB], "min_web": 1, "tc": _cambio(salida, usd_mxn, jpy_usd),
         "fuentes": fuentes, "archivos": archivos, "trozos": 256,
+        "universo": {"versiones": len(filas_u), "trozos": 256},
     }
     if vision:
         man["vision"] = vision
     _json_compacto(salida / "manifest.json", man)
     print(f"Listo: {salida} (dia {dia}) · buscar.json {archivos[0]['bytes'] / 1e6:.1f} MB · "
-          f"precios {total_p / 1e6:.1f} MB en 256 trozos · USD->MXN {man['tc'].get('usd_mxn')}")
+          f"precios {total_p / 1e6:.1f} MB en 256 trozos · universo {total_u / 1e6:.1f} MB · USD->MXN {man['tc'].get('usd_mxn')}")
     return man
 
 
@@ -1122,6 +1380,9 @@ def main(argv=None):
     p.add_argument("--tag", required=True)
     p.add_argument("--capa", action="append", default=[])
     p.add_argument("--anterior", help="carpeta con el release anterior ya bajado (para armar los parches)")
+    p = sub.add_parser("universo", help="arma el universo completo (todas las cartas) en el historial; corre despues de scryfall.py")
+    p.add_argument("--historial", default=str(RAIZ / "data" / "precios" / "historial.sqlite"))
+    p.add_argument("--bulk", default=str(RAIZ / "data" / "precios" / "scryfall" / "default-cards.jsonl.gz"))
     p = sub.add_parser("restaurar")
     p.add_argument("carpeta")
     p = sub.add_parser("web", help="archivos de la pagina web (manifest + buscar + precios + movers) en SALIDA")
@@ -1146,6 +1407,9 @@ def main(argv=None):
             print("No encontre datos en", RAIZ / "data")
             return 1
         print("\nSube TODOS los archivos de esa carpeta a un release con el tag  datos-inicial  (ver el tutorial).")
+        return 0
+    if a.accion == "universo":
+        armar_universo(a.historial, a.bulk)
         return 0
     if a.accion == "publicar":
         man = publicar(a.salida, a.tag, a.capa or [str(RAIZ)], a.anterior)

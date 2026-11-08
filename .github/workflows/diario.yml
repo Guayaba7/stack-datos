@@ -10,6 +10,9 @@ on:
       tiendas:
         description: "Que bajar (todas / sin-hareruya / sin-scg / solo-scryfall)"
         default: "todas"
+      universo:
+        description: "SCG: buscar tambien el universo completo (las de menos de $2) aunque no sea domingo (si / no)"
+        default: "no"
 
 permissions:
   contents: write                  # para crear el release del dia
@@ -39,10 +42,14 @@ jobs:
           mkdir -p anterior
           gh release download --repo "$GITHUB_REPOSITORY" --dir anterior --pattern 'manifest.json' \
             --pattern 'historial.sqlite.gz' --pattern 'hareruya_historial.sqlite.gz' --pattern 'scg.sqlite.gz' \
-            --pattern 'ck.sqlite.gz' --pattern 'hareruya_emparejado.sqlite.gz' || echo "Todavia no hay releases: se empieza de cero."
+            --pattern 'ck.sqlite.gz' --pattern 'hareruya_emparejado.sqlite.gz' --pattern 'scg_universo.sqlite.gz' \
+            --pattern 'hareruya_universo.sqlite.gz' || echo "Todavia no hay releases: se empieza de cero."
           python .github/nube.py restaurar anterior
       - name: Scryfall (Main1)
         run: python src/scryfall.py
+      - name: Universo (todas las cartas de papel, para las de menos de $2)
+        continue-on-error: true
+        run: python .github/nube.py universo
       - name: MTGJSON
         continue-on-error: true
         run: python src/mtgjson.py
@@ -67,6 +74,8 @@ jobs:
             data/tiendas/starcitygames/scg.sqlite
             data/tiendas/hareruya/historial_hareruya.sqlite
             data/tiendas/hareruya/emparejado/emparejado_*.sqlite
+            data/tiendas/starcitygames/scg_universo.sqlite
+            data/tiendas/hareruya/universo/historial_hareruya.sqlite
           retention-days: 2
           compression-level: 1
           if-no-files-found: error
@@ -139,6 +148,26 @@ jobs:
       - name: Pasar al historial
         if: ${{ steps.pc.outputs.listo == '1' || steps.revisar.outcome == 'success' }}
         run: python src/hareruya.py historial
+      - name: Universo de Hareruya (lo sube tu PC una vez por semana)
+        continue-on-error: true
+        run: |
+          mkdir -p universo_pc data/tiendas/hareruya/universo/descargas
+          gh release download hareruya-pc --repo "$GITHUB_REPOSITORY" --dir universo_pc --clobber --pattern 'universo_hareruya_seco_*' \
+            || { echo "La PC no ha subido un universo."; exit 0; }
+          for f in universo_pc/universo_*; do mv "$f" "data/tiendas/hareruya/universo/descargas/$(basename "$f" | sed 's/^universo_//')"; done
+          python - <<'PY' && STACK_UNIVERSO=1 python src/hareruya.py historial --todo || echo "El universo de esta semana ya estaba en el historial."
+          import os, sys
+          sys.path.insert(0, "src")
+          os.environ["STACK_UNIVERSO"] = "1"
+          import hareruya as h
+          secos = h.archivos_secos()
+          if not secos:
+              sys.exit(1)
+          dia = max(h.dia_de_seco(x) for x in secos)
+          ya = h.dias_registrados()
+          print(f"Universo de la PC: {dia} · ya en el historial: {dia in ya}")
+          sys.exit(1 if dia in ya else 0)
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: hareruya
@@ -146,6 +175,7 @@ jobs:
             data/.capa
             data/tiendas/hareruya/historial_hareruya.sqlite
             data/tiendas/hareruya/emparejado/emparejado_*.sqlite
+            data/tiendas/hareruya/universo/historial_hareruya.sqlite
           retention-days: 2
           compression-level: 1
 
@@ -167,12 +197,22 @@ jobs:
           path: data
       - name: Descargar StarCityGames
         run: python src/scg.py descargar
+      - name: StarCityGames, universo (las de menos de $2; los domingos)
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          if [ "$(date +%u)" = "7" ] || [ "${{ github.event.inputs.universo }}" = "si" ]; then
+            STACK_UNIVERSO=1 python src/scg.py descargar
+          else
+            echo "Hoy no toca el universo (los domingos)."
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: scg
           path: |
             data/.capa
             data/tiendas/starcitygames/scg.sqlite
+            data/tiendas/starcitygames/scg_universo.sqlite
           retention-days: 2
           compression-level: 1
 
