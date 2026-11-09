@@ -27,6 +27,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import unicodedata
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +49,9 @@ ARCHIVOS = {
     # universo (S-0.8.0): las de menos de $2 en SCG y Hareruya, una vez por semana
     "scg_universo.sqlite.gz": ("tiendas/starcitygames/scg_universo.sqlite", "SELECT dia FROM dias"),
     "hareruya_universo.sqlite.gz": ("tiendas/hareruya/universo/historial_hareruya.sqlite", "SELECT dia FROM dias"),
+    # 0.9.0: el texto y las reglas de cada carta (deckbuilder) y los decks del meta (src/meta.py)
+    "oraculo.sqlite.gz": ("precios/oraculo.sqlite", "SELECT dia FROM dias"),
+    "meta.sqlite.gz": ("meta/meta.sqlite", "SELECT dia FROM dias"),
 }
 ASSET_EMPAREJADO = "hareruya_emparejado.sqlite.gz"     # el emparejado mas reciente (precios de Hareruya de hoy)
 CARPETA_EMPAREJADO = "tiendas/hareruya/emparejado"
@@ -553,6 +558,129 @@ def _degz(gz, destino):
         shutil.copyfileobj(fi, fo, 1 << 20)
 
 
+# ---------------------------------------------------------------- oraculo: una fila por carta (no por impresion)
+# Lo que necesita el deckbuilder: coste, tipo, texto, identidad de color, legalidad por formato, Game Changer (brackets
+# de Commander) y una impresion para la imagen. Tambien los alias para reconocer nombres de MTGO ("Wear/Tear"), de
+# cartas de dos caras (solo la de enfrente) y sin acentos.
+FORMATOS_LEGAL = ["standard", "pioneer", "modern", "legacy", "vintage", "pauper", "commander", "brawl", "standardbrawl",
+                  "oathbreaker", "duel", "paupercommander", "premodern", "historic", "timeless"]
+DDL_ORACULO = """
+CREATE TABLE IF NOT EXISTS dias (dia TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS cartas (
+  nombre TEXT PRIMARY KEY, oracle_id TEXT, caras TEXT, coste TEXT, cmc REAL, tipo TEXT, texto TEXT, fuerza TEXT,
+  colores TEXT, identidad TEXT, legal TEXT, gc INTEGER, layout TEXT, sid TEXT, rareza TEXT, palabras TEXT, produce TEXT,
+  edhrec INTEGER, comandante INTEGER, pareja TEXT, lanzada TEXT);
+CREATE TABLE IF NOT EXISTS alias (clave TEXT PRIMARY KEY, nombre TEXT);
+"""
+LAYOUTS_SIN_ORACULO = {"token", "double_faced_token", "emblem", "art_series", "vanguard", "scheme", "planar"}
+ORDEN_COLOR = "WUBRG"
+
+
+def clave_carta(nombre):
+    """Llave para encontrar una carta escrita de cualquier forma: minusculas, sin acentos, '/' y '//' iguales."""
+    t = unicodedata.normalize("NFKD", str(nombre or "")).encode("ascii", "ignore").decode().lower()
+    t = re.sub(r"\s*/+\s*", " / ", t)
+    t = re.sub(r"[^a-z0-9/ ]+", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _pareja(c, texto, palabras):
+    """Como se junta con otro comandante: partner, partner con X, background, friends forever, companero del Doctor."""
+    if "Partner" in palabras:
+        m = re.search(r"Partner with ([^\n(]+)", texto)
+        return "con:" + m.group(1).strip() if m else "partner"
+    if "Choose a background" in texto:
+        return "background"
+    if "Friends forever" in palabras or "Friends forever" in texto:
+        return "friends"
+    if "Doctor's companion" in texto:
+        return "doctor"
+    if re.search(r"\bTime Lord Doctor\b", c.get("type_line") or ""):
+        return "es_doctor"
+    if "Background" in (c.get("type_line") or "") and "Legendary Enchantment" in (c.get("type_line") or ""):
+        return "es_background"
+    return None
+
+
+def armar_oraculo(bulk, salida):
+    """oraculo.sqlite desde el default-cards de Scryfall. -> numero de cartas."""
+    if not bulk or not Path(bulk).is_file():
+        raise RuntimeError("no hay default-cards de Scryfall (corre scryfall.py antes)")
+    mejores = {}                       # oracle_id -> (puntaje, carta)
+    with gzip.open(bulk, "rt", encoding="utf-8") as f:
+        for linea in f:
+            linea = linea.strip().rstrip(",")
+            if not linea.startswith("{"):
+                continue
+            try:
+                c = json.loads(linea)
+            except ValueError:
+                continue
+            oid = c.get("oracle_id") or ((c.get("card_faces") or [{}])[0].get("oracle_id"))
+            if not oid or c.get("layout") in LAYOUTS_SIN_ORACULO or "paper" not in (c.get("games") or []):
+                continue
+            if (c.get("set_type") or "") in ("memorabilia", "token"):
+                continue
+            # la impresion para la imagen: en ingles, normal (sin promo ni marco raro), la mas nueva
+            puntos = (c.get("lang") == "en", not c.get("promo"), not c.get("variation"), c.get("border_color") != "borderless",
+                      not (c.get("frame_effects") or []), c.get("released_at") or "")
+            if oid not in mejores or puntos > mejores[oid][0]:
+                mejores[oid] = (puntos, c)
+    filas, alias = [], {}
+    for oid, (_, c) in mejores.items():
+        caras = c.get("card_faces") or []
+        nombre = (c.get("name") or "").strip()
+        if not nombre:
+            continue
+        texto = c.get("oracle_text") if c.get("oracle_text") is not None else "\n//\n".join((x.get("oracle_text") or "") for x in caras)
+        coste = c.get("mana_cost")
+        if coste in (None, "") and caras:
+            costes = [x.get("mana_cost") or "" for x in caras]
+            coste = " // ".join(costes) if all(costes) else costes[0]
+        fuerza = None
+        fuente = c if c.get("power") is not None or c.get("loyalty") is not None or not caras else caras[0]
+        if fuente.get("power") is not None:
+            fuerza = f"{fuente.get('power')}/{fuente.get('toughness')}"
+        elif fuente.get("loyalty") is not None:
+            fuerza = f"[{fuente.get('loyalty')}]"
+        colores = c.get("colors")
+        if colores is None:
+            colores = sorted({x for cara in caras for x in (cara.get("colors") or [])})
+        leg = {k: v for k, v in (c.get("legalities") or {}).items() if k in FORMATOS_LEGAL and v in ("legal", "restricted", "banned")}
+        tipo = c.get("type_line") or " // ".join((x.get("type_line") or "") for x in caras)
+        palabras = c.get("keywords") or []
+        frente = (caras[0].get("type_line") if caras else tipo) or ""
+        comandante = int(("Legendary" in frente and ("Creature" in frente or "Spacecraft" in frente and "Station" in texto))
+                         or "can be your commander" in (texto or ""))
+        filas.append((nombre, oid, json.dumps([x.get("name") for x in caras], ensure_ascii=False) if caras else None,
+                      coste, c.get("cmc"), tipo, texto, fuerza,
+                      "".join(x for x in ORDEN_COLOR if x in colores), "".join(x for x in ORDEN_COLOR if x in (c.get("color_identity") or [])),
+                      json.dumps(leg, separators=(",", ":")), int(bool(c.get("game_changer"))), c.get("layout"), c.get("id"),
+                      c.get("rarity"), ", ".join(palabras) or None, "".join(c.get("produced_mana") or []) or None,
+                      c.get("edhrec_rank"), comandante, _pareja(c, texto or "", palabras), c.get("released_at")))
+        for n in [nombre] + [x.get("name") for x in caras[:1]] + [nombre.replace(" // ", "/")]:
+            if n:
+                alias.setdefault(clave_carta(n), nombre)
+    if len(filas) < 20_000:
+        raise RuntimeError(f"el default-cards trae muy pocas cartas ({len(filas):,}): no se arma el oraculo")
+    salida = Path(salida)
+    salida.parent.mkdir(parents=True, exist_ok=True)
+    tmp = salida.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    con = sqlite3.connect(tmp)
+    try:
+        con.executescript(DDL_ORACULO)
+        con.executemany("INSERT OR REPLACE INTO cartas VALUES (" + ",".join("?" * 21) + ")", filas)
+        con.executemany("INSERT OR REPLACE INTO alias VALUES (?, ?)", list(alias.items()))
+        con.execute("INSERT INTO dias VALUES (?)", (datetime.now(timezone.utc).strftime("%Y-%m-%d"),))
+        con.commit()
+    finally:
+        con.close()
+    os.replace(tmp, salida)
+    print(f"Oraculo: {len(filas):,} cartas · {len(alias):,} alias -> {salida}")
+    return len(filas)
+
+
 def _bulk_de(datas):
     for d in reversed(datas):
         b = d / "precios" / "scryfall" / "default-cards.jsonl.gz"
@@ -883,6 +1011,8 @@ def _bajar_release(cache):
         "ck": rutas.get("ck.sqlite"),
         "scg_u": rutas.get("scg_universo.sqlite"),
         "har_u": rutas.get("hareruya_universo.sqlite"),
+        "meta": rutas.get("meta.sqlite"),
+        "oraculo": rutas.get("oraculo.sqlite"),
     }
 
 
@@ -895,7 +1025,154 @@ def _rutas_locales():
         "ck": d / "tiendas/cardkingdom/ck.sqlite",
         "scg_u": d / "tiendas/starcitygames/scg_universo.sqlite",
         "har_u": d / "tiendas/hareruya/universo/historial_hareruya.sqlite",
+        "meta": d / "meta/meta.sqlite",
+        "oraculo": d / "precios/oraculo.sqlite",
     }
+
+
+# ---------------------------------------------------------------- META y oraculo para la web (0.9.0)
+META_FORMATOS = ["standard", "pioneer", "modern", "legacy", "pauper", "cedh", "commander"]
+META_DIAS, META_SEMANA = 21, 7
+BASICAS_META = {"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes", "Snow-Covered Plains", "Snow-Covered Island",
+                "Snow-Covered Swamp", "Snow-Covered Mountain", "Snow-Covered Forest"}
+
+
+def resumen_meta(ruta_meta, hoy_=None):
+    """Lo que muestra la pestana META: por formato, arquetipos (% propio con tendencia y % de MTGGoldfish), staples y
+    decks; el termometro de cada carta; Commander (EDHREC). Lo usa la web; la app hace lo mismo con su copia."""
+    from datetime import date, timedelta
+    con = abrir_ro(ruta_meta)
+    try:
+        hoy_ = hoy_ or date.today().isoformat()
+        desde = (date.fromisoformat(hoy_) - timedelta(days=META_DIAS)).isoformat()
+        semana = (date.fromisoformat(hoy_) - timedelta(days=META_SEMANA)).isoformat()
+        decks = {r[0]: r for r in con.execute(
+            "SELECT d.id, d.formato, d.fecha, d.arquetipo, d.fuente, d.puesto, d.resultado, d.jugador, d.url, d.comandante, "
+            "e.nombre, e.jugadores FROM decks d LEFT JOIN eventos e ON e.id = d.evento WHERE d.fecha >= ?", (desde,))}
+        cartas = defaultdict(list)
+        for d, n, q, z in con.execute("SELECT deck, nombre, cantidad, zona FROM cartas"):
+            if d in decks:
+                cartas[d].append((n, q, z))
+        gf = defaultdict(dict)
+        for fmt, nombre, pct, n, url, col, claves, lista in con.execute(
+                "SELECT formato, nombre, pct, n, url, colores, claves, lista FROM arquetipos"):
+            gf[fmt][nombre] = {"pct": pct, "n": n, "url": url, "colores": col, "claves": json.loads(claves or "[]"),
+                               "lista": json.loads(lista) if lista else None}
+        fuentes = [dict(zip(("fuente", "formato", "ok", "error_dia", "error", "n"), r)) for r in con.execute("SELECT * FROM fuentes")]
+        out = {"dia": hoy_, "ventana_dias": META_DIAS, "formatos": {}, "cartas": {}, "fuentes": fuentes}
+        indice = defaultdict(dict)
+        for fmt in META_FORMATOS:
+            if fmt == "commander":
+                continue
+            ds = [d for d in decks.values() if d[1] == fmt]
+            if not ds and fmt not in gf:
+                continue
+            nuevos = [d for d in ds if d[2] >= semana]
+            viejos = [d for d in ds if d[2] < semana]
+            cuenta, cuenta_n, cuenta_v = Counter(d[3] or "Otros" for d in ds), Counter(d[3] or "Otros" for d in nuevos), Counter(d[3] or "Otros" for d in viejos)
+            arqs = []
+            for nombre, n in cuenta.most_common():
+                g = gf[fmt].get(nombre) or {}
+                tend = None
+                if nuevos and viejos:
+                    tend = round(100 * (cuenta_n[nombre] / len(nuevos) - cuenta_v[nombre] / len(viejos)), 1)
+                arqs.append({"nombre": nombre, "n": n, "pct": round(100 * n / len(ds), 1), "tend": tend, "pct_gf": g.get("pct"),
+                             "colores": g.get("colores"), "claves": g.get("claves") or [], "url_gf": g.get("url")})
+            for nombre, g in gf[fmt].items():          # los de MTGGoldfish que no salieron en nuestros decks
+                if nombre not in cuenta:
+                    arqs.append({"nombre": nombre, "n": 0, "pct": 0, "tend": None, "pct_gf": g["pct"], "colores": g["colores"],
+                                 "claves": g["claves"], "url_gf": g["url"]})
+            arqs.sort(key=lambda a: (-(a["pct"] or 0), -(a["pct_gf"] or 0)))
+            # staples: en cuantos decks esta cada carta (main o side) y cuantas copias lleva en promedio
+            en, copias, en_n, en_v = Counter(), Counter(), Counter(), Counter()
+            for d in ds:
+                vistas = {}
+                for n, q, z in cartas.get(d[0], []):
+                    if n in BASICAS_META:
+                        continue
+                    vistas[n] = vistas.get(n, 0) + q
+                for n, q in vistas.items():
+                    en[n] += 1
+                    copias[n] += q
+                    (en_n if d[2] >= semana else en_v)[n] += 1
+            staples = []
+            for n, c in en.most_common(80):
+                staples.append({"nombre": n, "pct": round(100 * c / len(ds), 1), "copias": round(copias[n] / c, 1)})
+            for n, c in en.items():
+                pct = 100 * c / len(ds)
+                if pct >= 2:
+                    tend = None
+                    if nuevos and viejos:
+                        tend = round(100 * (en_n[n] / len(nuevos) - en_v[n] / len(viejos)), 1)
+                    indice[n][fmt] = [round(pct, 1), tend]
+            listas = []
+            for d in sorted(ds, key=lambda d: (d[2], -(d[5] or 99)), reverse=True):
+                cs = cartas.get(d[0], [])
+                listas.append({"id": d[0], "fecha": d[2], "arquetipo": d[3] or "Otros", "fuente": d[4], "puesto": d[5],
+                               "resultado": d[6], "jugador": d[7], "url": d[8], "comandante": d[9], "evento": d[10],
+                               "jugadores": d[11], "main": [[n, q] for n, q, z in cs if z == "main"],
+                               "side": [[n, q] for n, q, z in cs if z == "side"], "cmd": [[n, q] for n, q, z in cs if z == "cmd"]})
+            # lista tipica de MTGGoldfish de cada arquetipo (para los que no tienen decks propios)
+            tipicas = {nombre: g["lista"] for nombre, g in gf[fmt].items() if g.get("lista")}
+            out["formatos"][fmt] = {"decks_n": len(ds), "semana_n": len(nuevos), "arquetipos": arqs, "staples": staples,
+                                    "decks": listas, "tipicas": tipicas}
+        out["cartas"] = indice
+        # Commander casual (EDHREC)
+        top = [dict(zip(("nombre", "slug", "rango", "n_decks", "tendencia"), r)) for r in
+               con.execute("SELECT nombre, slug, rango, n_decks, tendencia FROM edhrec_comandantes ORDER BY rango")]
+        prom = defaultdict(list)
+        for c, n, q, t in con.execute("SELECT comandante, carta, cantidad, tipo FROM edhrec_promedio"):
+            prom[c].append([n, q, t])
+        if top:
+            out["formatos"]["commander"] = {"comandantes": top, "promedio": prom,
+                                            "dia": (con.execute("SELECT valor FROM meta WHERE clave = 'edhrec_dia'").fetchone() or [None])[0]}
+        return out
+    finally:
+        con.close()
+
+
+ORACULO_FORMATOS = ["standard", "pioneer", "modern", "legacy", "vintage", "pauper", "commander", "brawl", "standardbrawl",
+                    "oathbreaker", "duel", "paupercommander", "premodern", "historic", "timeless"]
+LETRA_LEGAL = {"legal": "l", "restricted": "r", "banned": "b"}
+
+
+def _web_meta(rutas, carpeta):
+    """meta/resumen.json + meta/<formato>.json + oraculo.json en la carpeta del dia. -> lo que va al manifest (o None)."""
+    info = {}
+    if rutas.get("oraculo") and rutas["oraculo"].is_file():
+        con = abrir_ro(rutas["oraculo"])
+        try:
+            filas_o = []
+            for r in con.execute("SELECT nombre, coste, cmc, tipo, identidad, colores, legal, gc, comandante, pareja, sid, fuerza, "
+                                 "rareza, edhrec FROM cartas ORDER BY nombre"):
+                leg = json.loads(r[6] or "{}")
+                filas_o.append([r[0], r[1] or "", r[2], r[3] or "", r[4] or "", r[5] or "",
+                                "".join(LETRA_LEGAL.get(leg.get(f), "-") for f in ORACULO_FORMATOS), r[7] or 0, r[8] or 0,
+                                r[9] or "", r[10] or "", r[11] or "", (r[12] or "")[:1], r[13]])
+        finally:
+            con.close()
+        b, sha = _json_compacto(carpeta / "oraculo.json", {"esquema": ESQUEMA_WEB, "formatos": ORACULO_FORMATOS,
+                                "columnas": ["nombre", "coste", "cmc", "tipo", "identidad", "colores", "legal", "gc", "comandante",
+                                             "pareja", "sid", "fuerza", "rareza", "edhrec"], "cartas": filas_o})
+        info["oraculo"] = {"cartas": len(filas_o), "bytes": b, "sha256": sha}
+    if rutas.get("meta") and rutas["meta"].is_file():
+        r = resumen_meta(rutas["meta"])
+        (carpeta / "meta").mkdir(exist_ok=True)
+        formatos = {}
+        for fmt, d in r["formatos"].items():
+            if fmt == "commander":
+                _json_compacto(carpeta / "meta" / "commander.json", {"esquema": ESQUEMA_WEB, **d})
+                formatos[fmt] = {"comandantes": len(d["comandantes"]), "dia": d.get("dia")}
+                continue
+            _json_compacto(carpeta / "meta" / f"{fmt}.json", {"esquema": ESQUEMA_WEB, "formato": fmt, "decks": d["decks"],
+                                                              "tipicas": d["tipicas"]})
+            formatos[fmt] = {"decks": d["decks_n"], "semana": d["semana_n"]}
+        resumen = {"esquema": ESQUEMA_WEB, "dia": r["dia"], "ventana_dias": r["ventana_dias"], "fuentes": r["fuentes"],
+                   "cartas": r["cartas"], "formatos": {fmt: {k: v for k, v in d.items() if k not in ("decks", "tipicas", "promedio")}
+                                                     for fmt, d in r["formatos"].items()}}
+        b, sha = _json_compacto(carpeta / "meta" / "resumen.json", resumen)
+        info["meta"] = {"formatos": formatos, "bytes": b, "sha256": sha}
+    return info or None
 
 
 LETRAS_FUENTE = (("har", "H"), ("har_jp", "J"), ("scg", "S"), ("ck", "C"))
@@ -1352,6 +1629,13 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
         except Exception as e:                                    # el escaner nunca tumba los precios del dia
             print(f"  (escaner: fallo {e.__class__.__name__}: {e}; se publica sin indice visual)")
 
+    # --- 5c) META y oraculo (deckbuilder) -------------------------------------------------------------------------
+    extra_meta = None
+    try:
+        extra_meta = _web_meta(rutas, carpeta)
+    except Exception as e:                                        # el meta nunca tumba los precios del dia
+        print(f"  (meta: fallo {e.__class__.__name__}: {e}; se publica sin META)")
+
     # --- 6) Dias que se quedan y manifest (al final: si algo fallo antes, el manifest viejo sigue apuntando al bueno) --
     guardados = sorted((p.name for p in salida.iterdir() if p.is_dir() and PATRON_DIA.match(p.name)), reverse=True)
     for viejo in guardados[DIAS_WEB:]:
@@ -1364,6 +1648,8 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
     }
     if vision:
         man["vision"] = vision
+    if extra_meta:
+        man.update(extra_meta)
     _json_compacto(salida / "manifest.json", man)
     print(f"Listo: {salida} (dia {dia}) · buscar.json {archivos[0]['bytes'] / 1e6:.1f} MB · "
           f"precios {total_p / 1e6:.1f} MB en 256 trozos · universo {total_u / 1e6:.1f} MB · USD->MXN {man['tc'].get('usd_mxn')}")
@@ -1383,6 +1669,7 @@ def main(argv=None):
     p = sub.add_parser("universo", help="arma el universo completo (todas las cartas) en el historial; corre despues de scryfall.py")
     p.add_argument("--historial", default=str(RAIZ / "data" / "precios" / "historial.sqlite"))
     p.add_argument("--bulk", default=str(RAIZ / "data" / "precios" / "scryfall" / "default-cards.jsonl.gz"))
+    p.add_argument("--oraculo", default=str(RAIZ / "data" / "precios" / "oraculo.sqlite"))
     p = sub.add_parser("restaurar")
     p.add_argument("carpeta")
     p = sub.add_parser("web", help="archivos de la pagina web (manifest + buscar + precios + movers) en SALIDA")
@@ -1410,6 +1697,7 @@ def main(argv=None):
         return 0
     if a.accion == "universo":
         armar_universo(a.historial, a.bulk)
+        armar_oraculo(a.bulk, a.oraculo)
         return 0
     if a.accion == "publicar":
         man = publicar(a.salida, a.tag, a.capa or [str(RAIZ)], a.anterior)

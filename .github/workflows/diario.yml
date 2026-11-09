@@ -43,11 +43,11 @@ jobs:
           gh release download --repo "$GITHUB_REPOSITORY" --dir anterior --pattern 'manifest.json' \
             --pattern 'historial.sqlite.gz' --pattern 'hareruya_historial.sqlite.gz' --pattern 'scg.sqlite.gz' \
             --pattern 'ck.sqlite.gz' --pattern 'hareruya_emparejado.sqlite.gz' --pattern 'scg_universo.sqlite.gz' \
-            --pattern 'hareruya_universo.sqlite.gz' || echo "Todavia no hay releases: se empieza de cero."
+            --pattern 'hareruya_universo.sqlite.gz' --pattern 'meta.sqlite.gz' || echo "Todavia no hay releases: se empieza de cero."
           python .github/nube.py restaurar anterior
       - name: Scryfall (Main1)
         run: python src/scryfall.py
-      - name: Universo (todas las cartas de papel, para las de menos de $2)
+      - name: Universo (todas las cartas de papel, para las de menos de $2) y oraculo (reglas de cada carta)
         continue-on-error: true
         run: python .github/nube.py universo
       - name: MTGJSON
@@ -76,6 +76,8 @@ jobs:
             data/tiendas/hareruya/emparejado/emparejado_*.sqlite
             data/tiendas/starcitygames/scg_universo.sqlite
             data/tiendas/hareruya/universo/historial_hareruya.sqlite
+            data/precios/oraculo.sqlite
+            data/meta/meta.sqlite
           retention-days: 2
           compression-level: 1
           if-no-files-found: error
@@ -216,9 +218,38 @@ jobs:
           retention-days: 2
           compression-level: 1
 
+  # 3b) META (0.9.0): decks de MTGO, MTGTop8, MTGGoldfish, TopDeck y EDHREC (en paralelo con las tiendas)
+  meta:
+    needs: base
+    if: ${{ github.event.inputs.tiendas != 'solo-scryfall' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - uses: actions/download-artifact@v4
+        with:
+          name: base
+          path: data
+      - name: Meta del dia
+        env:
+          TOPDECK_KEY: ${{ secrets.TOPDECK_KEY }}      # llave gratis de topdeck.gg/developers (sin ella se salta TopDeck)
+        run: python src/meta.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meta
+          path: |
+            data/.capa
+            data/meta/meta.sqlite
+          retention-days: 2
+          compression-level: 1
+
   # 4) Publicar lo que haya salido bien (si una tienda fallo, se publica la de ayer)
   publicar:
-    needs: [base, hareruya, scg]
+    needs: [base, hareruya, scg, meta]
     if: ${{ always() && needs.base.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -241,6 +272,11 @@ jobs:
         with:
           name: scg
           path: capas/scg/data
+      - uses: actions/download-artifact@v4
+        if: ${{ needs.meta.result == 'success' }}
+        with:
+          name: meta
+          path: capas/meta/data
       - name: Traer el release de ayer (para publicar solo lo que cambio)
         run: |
           mkdir -p anterior
@@ -254,10 +290,11 @@ jobs:
           CAPAS="--capa capas/base"
           [ -d capas/hareruya ] && CAPAS="$CAPAS --capa capas/hareruya"
           [ -d capas/scg ] && CAPAS="$CAPAS --capa capas/scg"
+          [ -d capas/meta ] && CAPAS="$CAPAS --capa capas/meta"
           python .github/nube.py publicar salida --tag "$TAG" $CAPAS --anterior anterior
       - name: Crear el release del dia
         run: |
-          NOTAS="Hareruya: ${{ needs.hareruya.result }} · SCG: ${{ needs.scg.result }}"
+          NOTAS="Hareruya: ${{ needs.hareruya.result }} · SCG: ${{ needs.scg.result }} · Meta: ${{ needs.meta.result }}"
           gh release create "$TAG" salida/* --repo "$GITHUB_REPOSITORY" --title "Datos $(date +%Y-%m-%d)" --notes "$NOTAS" --latest
       - name: Borrar releases viejos (se quedan los 7 mas nuevos)
         run: |
