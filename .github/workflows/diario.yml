@@ -123,7 +123,7 @@ jobs:
       - name: Descargar Hareruya
         if: ${{ steps.pc.outputs.listo != '1' }}
         continue-on-error: true
-        run: python src/hareruya.py descargar                 # 16 procesos (lo normal de hareruya.py)
+        run: python src/hareruya.py descargar                 # 32 procesos (lo normal de hareruya.py)
       - name: Revisar que Hareruya si respondio
         id: revisar
         if: ${{ steps.pc.outputs.listo != '1' }}
