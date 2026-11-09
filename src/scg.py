@@ -3,8 +3,8 @@ STARCITYGAMES para Stack (antes scg_tienda.py + scg_prueba.py): el precio NM de 
 
 Como funciona:
   1. Lee el catalogo del dia (data/precios/historial.sqlite, el que genera scryfall.py) y saca los NOMBRES distintos.
-  2. Busca cada nombre en la busqueda de StarCityGames (HawkSearch, la misma que usa su pagina), con 16 actores a la vez
-     (16 conexiones, cada una con su pausa). Lo que regresa SCG se guarda: si la descarga se detiene o se cierra la
+  2. Busca cada nombre en la busqueda de StarCityGames (HawkSearch, la misma que usa su pagina), con 32 actores a la vez
+     (32 conexiones, cada una con su pausa). Lo que regresa SCG se guarda: si la descarga se detiene o se cierra la
      computadora, al iniciarla otra vez sigue donde se quedo.
   3. Una segunda busqueda (nombre + set) para las versiones de cartas con muchisimas impresiones (basicas, staples).
   4. Empareja cada version con el producto EXACTO de SCG (mismo nombre, set / promo, numero, acabado e idioma; condicion
@@ -44,7 +44,7 @@ except (AttributeError, ValueError):
     pass
 
 TIENDA = "starcitygames"            # carpeta data/tiendas/starcitygames; el programa es src/scg.py
-N_ACTORES = 16                       # conexiones a la vez; cada una espera PAUSA_SEGUNDOS entre peticiones
+N_ACTORES = 32                       # conexiones a la vez; cada una espera PAUSA_SEGUNDOS entre peticiones
 
 URL_API = "https://ajax.starcitygames.com/hawksearch/searchapi/api/v2/search"
 URL_SITIO = "https://starcitygames.com"

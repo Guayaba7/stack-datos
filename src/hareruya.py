@@ -2,7 +2,7 @@
 HARERUYA para Stack: descarga los precios de Hareruya y los empareja contra el catalogo de Scryfall. Sin ventanas ni
 reportes: el avance y las inconsistencias se ven en Stack.
 
-    python src/hareruya.py              descarga toda la search_list con 16 procesos (si quedo una a medias, la retoma)
+    python src/hareruya.py              descarga toda la search_list con 32 procesos (si quedo una a medias, la retoma)
     python src/hareruya.py --n 20       prueba rapida con 20 nombres al azar
     python src/hareruya.py detener      pide parar la descarga (termina la carta en curso y guarda)
     python src/hareruya.py emparejar    empareja lo descargado (Stack lo hace solo al abrirse)
@@ -2217,9 +2217,9 @@ def actualizar_historial(avisar=print):
 
 
 # ====================================================================================================
-# E. DESCARGA (sin interfaz: 16 procesos; el avance lo ve Stack en data/tiendas/hareruya/progreso.json)
+# E. DESCARGA (sin interfaz: 32 procesos; el avance lo ve Stack en data/tiendas/hareruya/progreso.json)
 # ====================================================================================================
-N_WORKERS = 16               # procesos de descarga a la vez (cada uno con su pausa)
+N_WORKERS = 32               # procesos de descarga a la vez (cada uno con su pausa)
 MAX_ERRORES_SEGUIDOS = 3     # si el scraper falla asi de seguido (red caida, bloqueo) ese proceso se detiene: no se insiste
 
 
