@@ -1144,16 +1144,16 @@ def _web_meta(rutas, carpeta):
         try:
             filas_o = []
             for r in con.execute("SELECT nombre, coste, cmc, tipo, identidad, colores, legal, gc, comandante, pareja, sid, fuerza, "
-                                 "rareza, edhrec FROM cartas ORDER BY nombre"):
+                                 "rareza, edhrec, layout FROM cartas ORDER BY nombre"):
                 leg = json.loads(r[6] or "{}")
                 filas_o.append([r[0], r[1] or "", r[2], r[3] or "", r[4] or "", r[5] or "",
                                 "".join(LETRA_LEGAL.get(leg.get(f), "-") for f in ORACULO_FORMATOS), r[7] or 0, r[8] or 0,
-                                r[9] or "", r[10] or "", r[11] or "", (r[12] or "")[:1], r[13]])
+                                r[9] or "", r[10] or "", r[11] or "", (r[12] or "")[:1], r[13], r[14] or ""])   # layout (0.9.6): el 🔄 de las de dos caras
         finally:
             con.close()
         b, sha = _json_compacto(carpeta / "oraculo.json", {"esquema": ESQUEMA_WEB, "formatos": ORACULO_FORMATOS,
                                 "columnas": ["nombre", "coste", "cmc", "tipo", "identidad", "colores", "legal", "gc", "comandante",
-                                             "pareja", "sid", "fuerza", "rareza", "edhrec"], "cartas": filas_o})
+                                             "pareja", "sid", "fuerza", "rareza", "edhrec", "layout"], "cartas": filas_o})
         info["oraculo"] = {"cartas": len(filas_o), "bytes": b, "sha256": sha}
     if rutas.get("meta") and rutas["meta"].is_file():
         r = resumen_meta(rutas["meta"])
