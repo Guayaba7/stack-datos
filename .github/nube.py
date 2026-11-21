@@ -1359,6 +1359,161 @@ def _vision(filas, carpeta_dia, salida, cache):
     return {"modelo": f"modelo/{MODELO_VISION}", "dims": int(m.shape[1]), "cartas": len(ids)}
 
 
+# ------------------------------------------------------------------------------------------------------------------
+# Escaner por ARTE (0.9.7): una huella por ilustracion de TODAS las impresiones (tambien las de menos de $2, las tierras
+# full art y las impresas en phyrexiano o klingon). El arte no depende del idioma ni del texto: el telefono compara el
+# recuadro del arte de la carta que ve contra este indice y asi la reconoce aunque no pueda leer el nombre.
+# Las reimpresiones y las versiones en otros idiomas comparten ilustracion: se guarda UNA huella por (ilustracion, nombre)
+# con los primeros 8 caracteres del id de Scryfall de sus impresiones (el telefono completa el id con los datos del nombre).
+# La lista de impresiones sale del default-cards de Scryfall (se baja aqui); las imagenes 'art_crop' se guardan en la
+# cache (CARPETA/arte.npz): la primera vez son ~52,000 (unos 20-40 minutos), despues solo las nuevas de cada dia.
+# ------------------------------------------------------------------------------------------------------------------
+ARTE_SIN = {"token", "double_faced_token", "emblem", "art_series"}
+
+
+def _bulk_scryfall(tipo, contiene=None):
+    """Cartas (dict) de un archivo grande de Scryfall ('default-cards', 'all-cards'), leidas en flujo: no se guarda en disco.
+    Scryfall da el archivo como JSON Lines comprimido (jsonl_download_uri); download_uri queda por si vuelve el formato viejo."""
+    import io
+    import urllib.request
+    pedido = urllib.request.Request(f"https://api.scryfall.com/bulk-data/{tipo}",
+                                    headers={"User-Agent": "stack-datos", "Accept": "application/json"})
+    with urllib.request.urlopen(pedido, timeout=60) as r:
+        info = json.loads(r.read().decode("utf-8"))
+    uri = info.get("jsonl_download_uri") or info.get("download_uri")
+    if not uri:
+        raise RuntimeError(f"Scryfall no dio la direccion de {tipo}")
+    pedido = urllib.request.Request(uri, headers={"User-Agent": "stack-datos", "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(pedido, timeout=300) as r:
+        comprimido = uri.split("?")[0].endswith(".gz") or r.headers.get("Content-Encoding") == "gzip"
+        for linea in io.TextIOWrapper(gzip.GzipFile(fileobj=r) if comprimido else r, encoding="utf-8"):
+            linea = linea.strip().rstrip(",")
+            if linea.startswith("{") and (contiene is None or any(m in linea for m in contiene)):
+                yield json.loads(linea)
+
+
+def _impresiones_arte():
+    """[(ilustracion, nombre, sid, url_art_crop)] de todas las impresiones de papel del default-cards de Scryfall."""
+    out = []
+    for c in _bulk_scryfall("default-cards"):
+        if c.get("digital") or c.get("layout") in ARTE_SIN:
+            continue
+        cara = (c.get("card_faces") or [{}])[0]
+        iu = c.get("image_uris") or cara.get("image_uris") or {}
+        ill = c.get("illustration_id") or cara.get("illustration_id")
+        if ill and iu.get("art_crop"):
+            out.append((ill, c["name"], c["id"], iu["art_crop"]))
+    return out
+
+
+# Nombres impresos en otros idiomas (0.9.7): MTGJSON no trae todos (faltan muchas cartas nuevas y de Universes Beyond),
+# asi que se completan con el nombre impreso de cada impresion en espanol, frances, aleman, italiano, portugues y japones
+# del all-cards de Scryfall (~400 MB comprimido, leido en flujo). Con eso el escaner y la busqueda reconocen
+# "Defensa de Aang" o "Intervencion de Sefirot" aunque MTGJSON no los tenga.
+IDIOMAS_ALIAS = ("es", "fr", "de", "it", "pt", "ja")
+
+
+def _alias_scryfall():
+    """{nombre en ingles: {idioma: {nombres impresos}}} para los idiomas de IDIOMAS_ALIAS."""
+    marcas = tuple(f'"lang":"{i}"' for i in IDIOMAS_ALIAS) + tuple(f'"lang": "{i}"' for i in IDIOMAS_ALIAS)
+    out, n = {}, 0
+    for c in _bulk_scryfall("all-cards", marcas):           # las de ingles (la mayoria) ni se leen
+        if c.get("lang") not in IDIOMAS_ALIAS or c.get("digital"):
+            continue
+        caras = c.get("card_faces") or []
+        impresos = [c.get("printed_name")] + [x.get("printed_name") for x in caras]
+        if caras and all(x.get("printed_name") for x in caras):
+            impresos.append(" // ".join(x["printed_name"] for x in caras))
+        for nombre in impresos:
+            if nombre and nombre != c["name"]:
+                out.setdefault(c["name"], {}).setdefault(c["lang"], set()).add(nombre)
+                n += 1
+    print(f"  Nombres en otros idiomas (Scryfall): {len(out):,} cartas", flush=True)
+    return out
+
+
+def _vision_arte(carpeta_dia, cache):
+    import concurrent.futures as cf
+    import time
+    import urllib.request
+    import numpy as np
+    import cv2
+    import onnxruntime as ort
+    modelo = Path(__file__).resolve().parent / MODELO_VISION
+    imps = _impresiones_arte()
+    if len(imps) < 50000:
+        raise RuntimeError(f"el default-cards trae muy pocas impresiones ({len(imps):,})")
+    url_de = {}                                               # una imagen por ilustracion (la de la primera impresion)
+    for ill, _, _, u in imps:
+        url_de.setdefault(ill, u)
+    ruta_cache = Path(cache) / "arte.npz"
+    vec, version = {}, {}
+    if ruta_cache.is_file():
+        z = np.load(ruta_cache, allow_pickle=False)
+        if str(z["modelo"]) == MODELO_VISION:
+            for k, u, v in zip(z["ids"], z["urls"], z["vec"]):
+                vec[str(k)], version[str(k)] = v, str(u)
+    # la URL trae la version de la imagen (?123): si Scryfall cambia la imagen, se vuelve a calcular
+    faltan = [k for k, u in url_de.items() if version.get(k) != u]
+    print(f"  Escaner (arte): {len(url_de):,} ilustraciones · {len(url_de) - len(faltan):,} ya calculadas · {len(faltan):,} nuevas", flush=True)
+    if faltan:
+        sesion = ort.InferenceSession(str(modelo), providers=["CPUExecutionProvider"])
+        entrada = sesion.get_inputs()[0].name
+        mean = np.float32([0.485, 0.456, 0.406]); std = np.float32([0.229, 0.224, 0.225])
+
+        def bajar(k):
+            for intento in range(4):
+                try:
+                    pedido = urllib.request.Request(url_de[k], headers={"User-Agent": "stack-datos"})
+                    with urllib.request.urlopen(pedido, timeout=30) as r:
+                        im = cv2.imdecode(np.frombuffer(r.read(), np.uint8), cv2.IMREAD_COLOR)
+                    if im is not None:
+                        return k, cv2.resize(im, (224, 224), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    time.sleep(2 + 3 * intento)
+            return k, None
+
+        t0, hechas, fallas = time.time(), 0, 0
+        with cf.ThreadPoolExecutor(VISION_HILOS) as ex:
+            for i in range(0, len(faltan), 512):
+                bloque = list(ex.map(bajar, faltan[i:i + 512]))
+                buenas = [(k, im) for k, im in bloque if im is not None]
+                fallas += len(bloque) - len(buenas)
+                for j in range(0, len(buenas), 32):
+                    parte = buenas[j:j + 32]
+                    x = np.stack([cv2.cvtColor(im, cv2.COLOR_BGR2RGB).astype(np.float32) / 255 for _, im in parte])
+                    out = sesion.run(None, {entrada: ((x - mean) / std).transpose(0, 3, 1, 2).astype(np.float32)})[0]
+                    out /= np.linalg.norm(out, axis=1, keepdims=True)
+                    for (k, _), v in zip(parte, out):
+                        vec[k] = np.clip(np.round(v * 127), -127, 127).astype(np.int8)
+                        version[k] = url_de[k]
+                hechas += len(buenas)
+                if (i // 512) % 10 == 0:
+                    print(f"    {hechas:,}/{len(faltan):,} ({time.time() - t0:.0f} s)", flush=True)
+                    if hechas:                                    # guarda seguido: si el job se corta, manana sigue de aqui
+                        ids_c = sorted(vec)
+                        np.savez(ruta_cache, modelo=np.array(MODELO_VISION), ids=np.array(ids_c),
+                                 urls=np.array([version[k] for k in ids_c]), vec=np.stack([vec[k] for k in ids_c]))
+        print(f"  Escaner (arte): {hechas:,} calculadas en {time.time() - t0:.0f} s, {fallas} imagenes no bajaron", flush=True)
+        ids_c = sorted(vec)
+        np.savez(ruta_cache, modelo=np.array(MODELO_VISION), ids=np.array(ids_c),
+                 urls=np.array([version[k] for k in ids_c]), vec=np.stack([vec[k] for k in ids_c]))
+    # una entrada por (ilustracion, nombre) con los prefijos de sus impresiones
+    grupos = {}
+    for ill, nombre, sid, _ in imps:
+        if ill in vec:
+            grupos.setdefault((ill, nombre), []).append(sid[:8])
+    claves = sorted(grupos)
+    nombres = sorted({n for _, n in claves})
+    pos = {n: i for i, n in enumerate(nombres)}
+    m = np.stack([vec[ill] for ill, _ in claves]).astype(np.int8)
+    (carpeta_dia / "arte.bin").write_bytes(m.tobytes())
+    _json_compacto(carpeta_dia / "arte.json", {"esquema": 1, "modelo": MODELO_VISION, "dims": int(m.shape[1]), "nombres": nombres,
+                                              "e": [[pos[n], " ".join(sorted(set(grupos[(ill, n)])))] for ill, n in claves]})
+    print(f"  Escaner (arte): indice de {len(claves):,} artes ({m.nbytes / 1e6:.1f} MB)", flush=True)
+    return {"dims": int(m.shape[1]), "artes": len(claves)}
+
+
 def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
     """Arma los archivos de la pagina a partir de los sqlite del dia. Devuelve el manifest.
     huellas: carpeta de cache del escaner (si se pasa, se arma el indice visual vision.bin)."""
@@ -1412,6 +1567,24 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
                 alias_latinos.setdefault(name, []).append(nombre)
     except sqlite3.Error:
         pass
+    try:                                                          # 0.9.7: lo que MTGJSON no tiene, de Scryfall
+        import unicodedata
+        antes = len(alias_latinos)
+        for name, por_idioma in _alias_scryfall().items():
+            for idioma in IDIOMAS_ALIAS:
+                for nombre in sorted(por_idioma.get(idioma, ())):
+                    if idioma == "ja":
+                        ja = "".join(unicodedata.normalize("NFKC", nombre).split())
+                        if ja and ja not in alias_ja.get(name, []):
+                            alias_ja.setdefault(name, []).append(ja)
+                        continue
+                    if idioma == "es" and nombre not in alias_es.get(name, []):
+                        alias_es.setdefault(name, []).append(nombre)
+                    if nombre not in alias_latinos.get(name, []):
+                        alias_latinos.setdefault(name, []).append(nombre)
+        print(f"  Alias: {antes:,} cartas con nombre en otro idioma (MTGJSON) -> {len(alias_latinos):,} (con Scryfall)", flush=True)
+    except Exception as e:                                         # sin internet o Scryfall caido: quedan los de MTGJSON
+        print(f"  (alias de Scryfall: fallo {e.__class__.__name__}: {e}; quedan los de MTGJSON)", flush=True)
     try:
         nuevas_hoy = list(con.execute(
             "SELECT n, acabado, dia_entrada FROM entradas WHERE estado = 'confirmada' AND motivo = 'subio' "
@@ -1628,6 +1801,11 @@ def web(salida, rutas, usd_mxn=None, jpy_usd=None, huellas=None):
             print(f"  (escaner: falta una libreria ({e.name}); se publica sin indice visual)")
         except Exception as e:                                    # el escaner nunca tumba los precios del dia
             print(f"  (escaner: fallo {e.__class__.__name__}: {e}; se publica sin indice visual)")
+        if vision:
+            try:
+                vision["arte"] = _vision_arte(carpeta, Path(huellas))
+            except Exception as e:                                # sin arte el escaner sigue como antes (nombre + huella)
+                print(f"  (escaner arte: fallo {e.__class__.__name__}: {e}; se publica sin indice de arte)")
 
     # --- 5c) META y oraculo (deckbuilder) -------------------------------------------------------------------------
     extra_meta = None

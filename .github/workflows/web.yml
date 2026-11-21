@@ -25,7 +25,7 @@ env:
 jobs:
   armar:
     runs-on: ubuntu-latest
-    timeout-minutes: 120              # la primera vez el escaner calcula ~38,000 huellas; despues solo las nuevas
+    timeout-minutes: 180              # la primera vez el escaner calcula ~38,000 huellas y ~52,000 artes (0.9.7); despues solo las nuevas
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
